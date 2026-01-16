@@ -1,0 +1,88 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging/build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+*.spec
+*.manifest
+
+# Qt/PySide6 generated files
+*.moc
+*.qrc
+*.qmlc
+*.jsc
+*.cache
+*.ui.py
+*.qrc.py
+*.qt-for-python/
+
+# IDE/editor
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs/temp
+logs/
+log/
+*.log
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+*.orig
+
+# Runtime outputs (keep assets/)
+output/
+results/
+exports/
+captures/
+frames/
+temp_frames/
+
+# Local settings/secrets
+config/local_settings.py
+config/secrets.json
+*.key
+*.pem
+*.crt
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+data/*.db
+data/sessions/
+data/session_frames/
+data/frame_records/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing/coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+
+# Outputs and generated data
+data/*
+chceckpoints/*
+utils/credentials.json
+utils/token.json

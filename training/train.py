@@ -1,0 +1,318 @@
+"""
+Main training script for Poomsae LSTM model
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from pathlib import Path
+import json
+from tqdm import tqdm
+import numpy as np
+import sys
+
+# Add parent directory to path to import modules
+sys.path.append(str(Path(__file__).parent.parent))
+
+from models.lstm_classifier import PoomsaeLSTM
+from training.dataset import create_dataloaders
+from configs.lstm_config import LSTMConfig
+from configs.training_config import TrainingConfig
+from configs.paths import Paths
+
+
+class Trainer:
+    """Handles model training and validation"""
+
+    def __init__(self, model, train_loader, val_loader, config):
+        """
+        Args:
+            model: PyTorch model to train
+            train_loader: Training data loader
+            val_loader: Validation data loader
+            config: Training configuration
+        """
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
+
+        # Setup device
+        self.device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
+        print(f"\nUsing device: {self.device}")
+
+        self.model = self.model.to(self.device)
+
+        # Loss function
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTHING)
+
+        # Optimizer
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY
+        )
+
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            patience=config.SCHEDULER_PATIENCE,
+            factor=config.SCHEDULER_FACTOR,
+        )
+
+        # Tracking variables
+        self.best_val_loss = float('inf')
+        self.best_val_acc = 0.0
+        self.train_losses = []
+        self.val_losses = []
+        self.train_accs = []
+        self.val_accs = []
+        self.patience_counter = 0
+        self.current_epoch = 0
+
+    def train_epoch(self):
+        """Train for one epoch"""
+        self.model.train()
+
+        total_loss = 0
+        correct = 0
+        total = 0
+
+        pbar = tqdm(
+            self.train_loader,
+            desc=f"Epoch {self.current_epoch + 1}/{self.config.EPOCHS} [Train]"
+        )
+
+        for batch_idx, (data, target) in enumerate(pbar):
+            # Move to device
+            data = data.to(self.device)
+            target = target.to(self.device)
+
+            # Forward pass
+            self.optimizer.zero_grad()
+            output = self.model(data)
+            loss = self.criterion(output, target)
+
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+
+            # Track metrics
+            total_loss += loss.item()
+            _, predicted = output.max(1)
+            total += target.size(0)
+            correct += predicted.eq(target).sum().item()
+
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100. * correct / total:.2f}%'
+            })
+
+        avg_loss = total_loss / len(self.train_loader)
+        avg_acc = 100.0 * correct / total
+
+        return avg_loss, avg_acc
+
+    def validate(self):
+        """Validate model"""
+        self.model.eval()
+
+        total_loss = 0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for data, target in tqdm(self.val_loader, desc="Validating"):
+                data = data.to(self.device)
+                target = target.to(self.device)
+
+                output = self.model(data)
+                loss = self.criterion(output, target)
+
+                total_loss += loss.item()
+                _, predicted = output.max(1)
+                total += target.size(0)
+                correct += predicted.eq(target).sum().item()
+
+        avg_loss = total_loss / len(self.val_loader)
+        avg_acc = 100.0 * correct / total
+
+        return avg_loss, avg_acc
+
+    def train(self):
+        """Full training loop"""
+        print(f"\n{'=' * 60}")
+        print("TRAINING START")
+        print(f"{'=' * 60}")
+        print(f"Model: {self.model.__class__.__name__}")
+        print(f"Device: {self.device}")
+        print(f"Train samples: {len(self.train_loader.dataset)}")
+        print(f"Val samples: {len(self.val_loader.dataset)}")
+        print(f"Batch size: {self.config.BATCH_SIZE}")
+        print(f"Epochs: {self.config.EPOCHS}")
+        print(f"Learning rate: {self.config.LEARNING_RATE}")
+        print(f"{'=' * 60}\n")
+
+        for epoch in range(self.config.EPOCHS):
+            self.current_epoch = epoch
+
+            # Train
+            train_loss, train_acc = self.train_epoch()
+
+            # Validate
+            val_loss, val_acc = self.validate()
+
+            # Track history
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            self.train_accs.append(train_acc)
+            self.val_accs.append(val_acc)
+
+            # Print epoch summary
+            print(f"\nEpoch {epoch + 1}/{self.config.EPOCHS} Summary:")
+            print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            print(f"  Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+
+            # Learning rate scheduling
+            old_lr = self.optimizer.param_groups[0]['lr']
+            self.scheduler.step(val_loss)
+            new_lr = self.optimizer.param_groups[0]['lr']
+
+            if new_lr != old_lr:
+                print(f"  Learning rate: {old_lr:.6f} → {new_lr:.6f}")
+
+            # Save best model
+            if val_acc > self.best_val_acc:
+                improvement = val_acc - self.best_val_acc
+                self.best_val_acc = val_acc
+                self.best_val_loss = val_loss
+                self.save_checkpoint('best')
+                print(f"  ✓ New best model! (↑{improvement:.2f}%) Saved as 'best'")
+                self.patience_counter = 0
+            else:
+                self.patience_counter += 1
+                print(f"  No improvement ({self.patience_counter}/{self.config.EARLY_STOPPING_PATIENCE})")
+
+            # Early stopping check
+            if self.patience_counter >= self.config.EARLY_STOPPING_PATIENCE:
+                print(f"\n{'=' * 60}")
+                print(f"Early stopping triggered at epoch {epoch + 1}")
+                print(f"{'=' * 60}")
+                break
+
+            # Regular checkpoint
+            if (epoch + 1) % self.config.SAVE_EVERY == 0:
+                self.save_checkpoint(f'epoch_{epoch + 1}')
+                print(f"  ✓ Checkpoint saved: epoch_{epoch + 1}")
+
+            print()  # Empty line between epochs
+
+        # Training complete
+        print(f"\n{'=' * 60}")
+        print("TRAINING COMPLETE")
+        print(f"{'=' * 60}")
+        print(f"Best Validation Accuracy: {self.best_val_acc:.2f}%")
+        print(f"Best Validation Loss: {self.best_val_loss:.4f}")
+        print(f"Total Epochs: {self.current_epoch + 1}")
+        print(f"{'=' * 60}\n")
+
+    def save_checkpoint(self, name):
+        """Save model checkpoint"""
+        checkpoint_dir = Paths.CHECKPOINTS_DIR
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_path = checkpoint_dir / f'lstm_taegeuk1_{name}.pth'
+
+        checkpoint = {
+            'epoch': self.current_epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_val_acc': self.best_val_acc,
+            'best_val_loss': self.best_val_loss,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'train_accs': self.train_accs,
+            'val_accs': self.val_accs
+        }
+
+        torch.save(checkpoint, checkpoint_path)
+
+        # Save training history as JSON
+        history_path = checkpoint_dir / f'training_history_{name}.json'
+        history = {
+            'epoch': self.current_epoch + 1,
+            'train_losses': [float(x) for x in self.train_losses],
+            'val_losses': [float(x) for x in self.val_losses],
+            'train_accs': [float(x) for x in self.train_accs],
+            'val_accs': [float(x) for x in self.val_accs],
+            'best_val_acc': float(self.best_val_acc),
+            'best_val_loss': float(self.best_val_loss)
+        }
+
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
+
+
+def main():
+    """Main training function"""
+
+    # Load configurations
+    lstm_config = LSTMConfig()
+    training_config = TrainingConfig()
+
+    # Create necessary directories
+    Paths.create_directories()
+
+    print("Creating dataloaders...")
+
+    # Create dataloaders
+    train_loader, val_loader, test_loader = create_dataloaders(
+        data_dir=Paths.WINDOWS_DIR,
+        batch_size=training_config.BATCH_SIZE,
+        train_split=training_config.TRAIN_SPLIT,
+        val_split=training_config.VAL_SPLIT,
+        num_workers=training_config.NUM_WORKERS
+    )
+
+    # Create model
+    print("\nCreating model...")
+    model = PoomsaeLSTM(lstm_config)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(f"\nModel Summary:")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+
+    # Create trainer
+    trainer = Trainer(model, train_loader, val_loader, training_config)
+
+    # Train
+    trainer.train()
+
+    # Evaluate on test set
+    print("Evaluating on test set...")
+
+    # Load best model
+    best_checkpoint = torch.load(Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth')
+    model.load_state_dict(best_checkpoint['model_state_dict'])
+    model = model.to(trainer.device)
+
+    # Create temporary trainer for evaluation
+    test_trainer = Trainer(model, train_loader, test_loader, training_config)
+    test_loss, test_acc = test_trainer.validate()
+
+    print(f"\n{'=' * 60}")
+    print("FINAL TEST RESULTS")
+    print(f"{'=' * 60}")
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {test_acc:.2f}%")
+    print(f"{'=' * 60}\n")
+
+
+if __name__ == "__main__":
+    main()
