@@ -461,7 +461,7 @@ def main():
                         choices=['cuda', 'cpu'], help='Device')
     parser.add_argument('--save-video', action='store_true',
                         help='Save annotated video')
-    parser.add_argument('--output', type=str, default='output_video.mp4',
+    parser.add_argument('--output', type=str, default='P001_output_video_32.mp4',
                         help='Output video path')
 
     args = parser.parse_args()
