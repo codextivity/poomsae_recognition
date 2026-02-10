@@ -217,7 +217,7 @@ def main():
     # Process videos in raw videos directory
     process_all_videos(
         video_dir=Paths.RAW_VIDEOS,
-        output_dir=r"D:\All Docs\All Projects\Pycharm\poomsae_recognition\data\raw\30_fps",  # None = replace originals
+        output_dir=r"D:\All Docs\All Projects\Pycharm\poomsae_recognition\data\raw\drive-download",  # None = replace originals
         backup_originals=True  # Keep backups
     )
 

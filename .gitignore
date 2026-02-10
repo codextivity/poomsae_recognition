@@ -86,3 +86,7 @@ data/*
 chceckpoints/*
 utils/credentials.json
 utils/token.json
+checkpoints
+*.mp4
+*.json
+*.pth

@@ -20,12 +20,14 @@ from training.dataset import create_dataloaders
 from configs.lstm_config import LSTMConfig
 from configs.training_config import TrainingConfig
 from configs.paths import Paths
+from preprocessing.create_windows import CLASS_MAPPING, CLASS_NAMES
 
 
 class Trainer:
     """Handles model training and validation"""
 
-    def __init__(self, model, train_loader, val_loader, config, class_weights=None):
+    def __init__(self, model, train_loader, val_loader, config, class_weights=None,
+                 lstm_config=None, class_mapping=None):
         """
         Args:
             model: PyTorch model to train
@@ -33,11 +35,15 @@ class Trainer:
             val_loader: Validation data loader
             config: Training configuration
             class_weights: Optional tensor of class weights for imbalanced data
+            lstm_config: LSTM model configuration (for saving)
+            class_mapping: Class name mapping (for saving)
         """
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
+        self.lstm_config = lstm_config
+        self.class_mapping = class_mapping
 
         # Setup device
         self.device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
@@ -48,7 +54,7 @@ class Trainer:
         # Move class weights to device if provided
         if class_weights is not None:
             class_weights = class_weights.to(self.device)
-            print(f"✓ Class weights applied for imbalanced data handling")
+            print(f"[OK] Class weights applied for imbalanced data handling")
 
         # Loss function (with optional class weights)
         self.criterion = nn.CrossEntropyLoss(
@@ -198,8 +204,8 @@ class Trainer:
                 improvement = val_acc - self.best_val_acc
                 self.best_val_acc = val_acc
                 self.best_val_loss = val_loss
-                self.save_checkpoint('best')
-                print(f"  ✓ New best model! (↑{improvement:.2f}%) Saved as 'best'")
+                self.save_checkpoint('best', self.lstm_config, self.config, self.class_mapping)
+                print(f"  [OK] New best model! (+{improvement:.2f}%) Saved as 'best'")
                 self.patience_counter = 0
             else:
                 self.patience_counter += 1
@@ -214,8 +220,8 @@ class Trainer:
 
             # Regular checkpoint
             if (epoch + 1) % self.config.SAVE_EVERY == 0:
-                self.save_checkpoint(f'epoch_{epoch + 1}')
-                print(f"  ✓ Checkpoint saved: epoch_{epoch + 1}")
+                self.save_checkpoint(f'epoch_{epoch + 1}', self.lstm_config, self.config, self.class_mapping)
+                print(f"  [OK] Checkpoint saved: epoch_{epoch + 1}")
 
             print()  # Empty line between epochs
 
@@ -228,14 +234,16 @@ class Trainer:
         print(f"Total Epochs: {self.current_epoch + 1}")
         print(f"{'=' * 60}\n")
 
-    def save_checkpoint(self, name):
-        """Save model checkpoint"""
+    def save_checkpoint(self, name, lstm_config=None, training_config=None, class_mapping=None):
+        """Save model checkpoint with full metadata"""
         checkpoint_dir = Paths.CHECKPOINTS_DIR
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         checkpoint_path = checkpoint_dir / f'lstm_taegeuk1_{name}.pth'
 
+        # Build checkpoint with all important metadata
         checkpoint = {
+            # Training state
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -245,12 +253,42 @@ class Trainer:
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'train_accs': self.train_accs,
-            'val_accs': self.val_accs
+            'val_accs': self.val_accs,
         }
+
+        # Add model architecture config
+        if lstm_config:
+            checkpoint['model_config'] = {
+                'input_size': lstm_config.INPUT_SIZE,
+                'hidden_size': lstm_config.HIDDEN_SIZE,
+                'num_layers': lstm_config.NUM_LAYERS,
+                'dropout': lstm_config.DROPOUT,
+                'bidirectional': lstm_config.BIDIRECTIONAL,
+                'num_classes': lstm_config.NUM_CLASSES,
+                'sequence_length': lstm_config.SEQUENCE_LENGTH,
+                'stride': lstm_config.STRIDE,
+            }
+
+        # Add training config
+        if training_config:
+            checkpoint['training_config'] = {
+                'batch_size': training_config.BATCH_SIZE,
+                'learning_rate': training_config.LEARNING_RATE,
+                'weight_decay': training_config.WEIGHT_DECAY,
+                'label_smoothing': training_config.LABEL_SMOOTHING,
+                'short_movement_classes': getattr(training_config, 'SHORT_MOVEMENT_CLASSES', []),
+                'short_movement_weight_multiplier': getattr(training_config, 'SHORT_MOVEMENT_WEIGHT_MULTIPLIER', 1.0),
+            }
+
+        # Add class mapping
+        if class_mapping:
+            checkpoint['class_mapping'] = class_mapping
+            checkpoint['class_names'] = list(class_mapping.keys())
+            checkpoint['num_classes'] = len(class_mapping)
 
         torch.save(checkpoint, checkpoint_path)
 
-        # Save training history as JSON
+        # Save training history as JSON (human readable)
         history_path = checkpoint_dir / f'training_history_{name}.json'
         history = {
             'epoch': self.current_epoch + 1,
@@ -259,11 +297,15 @@ class Trainer:
             'train_accs': [float(x) for x in self.train_accs],
             'val_accs': [float(x) for x in self.val_accs],
             'best_val_acc': float(self.best_val_acc),
-            'best_val_loss': float(self.best_val_loss)
+            'best_val_loss': float(self.best_val_loss),
+            # Include config in JSON too
+            'model_config': checkpoint.get('model_config', {}),
+            'training_config': checkpoint.get('training_config', {}),
+            'num_classes': checkpoint.get('num_classes', 22),
         }
 
-        with open(history_path, 'w') as f:
-            json.dump(history, f, indent=2)
+        with open(history_path, 'w', encoding='utf-8') as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
 
 
 def main():
@@ -296,20 +338,32 @@ def main():
 
     class_counts = np.bincount(train_labels, minlength=lstm_config.NUM_CLASSES)
     total = len(train_labels)
-    class_weights = total / (lstm_config.NUM_CLASSES * class_counts)
+    class_weights = total / (lstm_config.NUM_CLASSES * class_counts + 1e-6)
+
+    # Apply extra weight multiplier for short movement classes
+    short_classes = getattr(training_config, 'SHORT_MOVEMENT_CLASSES', [])
+    short_multiplier = getattr(training_config, 'SHORT_MOVEMENT_WEIGHT_MULTIPLIER', 1.0)
+
+    for class_idx in short_classes:
+        if class_idx < len(class_weights):
+            class_weights[class_idx] *= short_multiplier
+
     class_weights = torch.FloatTensor(class_weights)
 
-    print("\nClass weights (higher weight = minority class):")
-    print(f"{'Movement':<15} {'Samples':>10} {'Weight':>10}")
-    print("-" * 40)
+    print("\nClass weights (higher weight = more attention):")
+    print(f"{'Class':<8} {'ID':<8} {'Samples':>10} {'Weight':>10} {'Note':<15}")
+    print("-" * 55)
     for i in range(lstm_config.NUM_CLASSES):
-        print(f"Movement {i + 1:2d}    {class_counts[i]:>10}   {class_weights[i]:>9.3f}")
+        note = "** SHORT **" if i in short_classes else ""
+        print(f"{i:<8} {i:<8} {class_counts[i]:>10}   {class_weights[i]:>9.3f}  {note}")
 
     # Highlight extremes
     min_weight_idx = class_weights.argmin().item()
     max_weight_idx = class_weights.argmax().item()
-    print(f"\nMajority class: Movement {min_weight_idx + 1} (weight={class_weights[min_weight_idx]:.3f})")
-    print(f"Minority class: Movement {max_weight_idx + 1} (weight={class_weights[max_weight_idx]:.3f})")
+    print(f"\nLowest weight: Class {min_weight_idx} (weight={class_weights[min_weight_idx]:.3f})")
+    print(f"Highest weight: Class {max_weight_idx} (weight={class_weights[max_weight_idx]:.3f})")
+    if short_classes:
+        print(f"Short movement classes {short_classes} have {short_multiplier}x weight boost")
 
     # Create model
     print("\nCreating model...")
@@ -322,8 +376,12 @@ def main():
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
 
-    # Create trainer with class weights
-    trainer = Trainer(model, train_loader, val_loader, training_config, class_weights)
+    # Create trainer with class weights and metadata for saving
+    trainer = Trainer(
+        model, train_loader, val_loader, training_config, class_weights,
+        lstm_config=lstm_config,
+        class_mapping=CLASS_MAPPING
+    )
 
     # Train
     trainer.train()

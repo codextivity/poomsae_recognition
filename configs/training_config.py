@@ -18,6 +18,12 @@ class TrainingConfig:
     LOSS_FUNCTION = 'CrossEntropyLoss'
     LABEL_SMOOTHING = 0.1
 
+    # Class weighting for short movements
+    # These classes have shorter durations and fewer samples
+    # Give them higher weight so model pays more attention
+    SHORT_MOVEMENT_CLASSES = [6, 12, 14, 17]  # 6_1, 12_1, 14_1, 16_1
+    SHORT_MOVEMENT_WEIGHT_MULTIPLIER = 3.0  # 3x penalty for misclassifying these
+
     # Early stopping
     EARLY_STOPPING_PATIENCE = 20
     MIN_DELTA = 0.001

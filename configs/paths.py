@@ -25,6 +25,7 @@ class Paths:
     # Model directories
     MODELS_DIR = ROOT / 'models'
     CHECKPOINTS_DIR = ROOT / 'checkpoints'
+    RTMPOSE_MODELS_DIR = CHECKPOINTS_DIR / 'rtmpose_models'
 
     # Results
     RESULTS_DIR = ROOT / 'results'

@@ -36,6 +36,7 @@ class RTMLibExtractor:
             raise
 
         self.pose_estimator = self.BodyWithFeet(
+            to_openpose=False,  # Use Halpe26 format
             mode='balanced',
             backend='onnxruntime',
             device='cuda'
@@ -44,8 +45,8 @@ class RTMLibExtractor:
         self.num_keypoints = 26
         self.normalize = normalize
 
-        print(f"✓ RTMPose initialized")
-        print(f"  Keypoints: {self.num_keypoints} (Body + Feet)")
+        print(f"[OK] RTMPose initialized")
+        print(f"  Keypoints: {self.num_keypoints} (Halpe26 - Body + Feet)")
         print(f"  Normalization: {'ENABLED (hip-centered + height-scaled)' if normalize else 'DISABLED'}")
 
     def normalize_keypoints(self, keypoints):
@@ -127,7 +128,7 @@ class RTMLibExtractor:
         if self.normalize:
             print(f"  Normalizing...")
             keypoints_array = self.normalize_keypoints(keypoints_array)
-            print(f"  ✓ Normalized")
+            print(f"  [OK] Normalized")
 
         if save_path:
             data = {
@@ -142,7 +143,7 @@ class RTMLibExtractor:
             with open(save_path, 'wb') as f:
                 pickle.dump(data, f)
 
-            print(f"  ✓ Saved: {save_path.name}")
+            print(f"  [OK] Saved: {save_path.name}")
 
         return keypoints_array
 
@@ -178,13 +179,13 @@ class RTMLibExtractor:
             output_file = output_dir / f"{video_file.stem}_keypoints.pkl"
 
             if output_file.exists():
-                print(f"\n⊙ Skipping {video_file.name} (already exists)")
+                print(f"\n[SKIP] {video_file.name} (already exists)")
                 continue
 
             self.extract_from_video(video_file, output_file)
 
         print(f"\n{'='*70}")
-        print(f"✓ COMPLETE")
+        print(f"[OK] COMPLETE")
         print(f"{'='*70}\n")
 
 

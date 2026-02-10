@@ -10,11 +10,11 @@ class LSTMConfig:
     BIDIRECTIONAL = True
 
     # Output
-    NUM_CLASSES = 20  # For Taegeuk 1
+    NUM_CLASSES = 22  # For Taegeuk 1 (includes sub-movements 14_1, 14_2, 16_1, 16_2)
 
     # Sequence parameters
-    SEQUENCE_LENGTH = 32  # 3 seconds at 30 FPS
-    STRIDE = 5  # 0.33 seconds
+    SEQUENCE_LENGTH = 24  # 0.8 seconds at 30 FPS (optimized for short movements)
+    STRIDE = 2  # Dense sampling for better short movement detection
 
     # Feature engineering
     USE_JOINT_ANGLES = False
