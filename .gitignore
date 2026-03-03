@@ -90,3 +90,12 @@ checkpoints
 *.mp4
 *.json
 *.pth
+
+# Debug logs
+debug_logs/
+
+# Generated images
+*.png
+
+# Null device artifact
+nul
