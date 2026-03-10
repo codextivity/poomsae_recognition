@@ -179,4 +179,15 @@
   "training_config": {
     "batch_size": 32,
     "learning_rate": 0.001,
-    "weight_decay
+    "weight_decay": 1e-05,
+    "label_smoothing": 0.1,
+    "short_movement_classes": [
+      6,
+      12,
+      14,
+      17
+    ],
+    "short_movement_weight_multiplier": 3.0
+  },
+  "num_classes": 22
+}
