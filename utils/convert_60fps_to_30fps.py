@@ -121,10 +121,13 @@ def process_all_videos(video_dir, output_dir=None, backup_originals=True):
     print(f"\nFPS Distribution:")
     for fps, files in sorted(fps_summary.items()):
         print(f"  {fps} FPS: {len(files)} videos")
-        if fps >= 59:
-            for file in files[:3]:  # Show first 3
+        if fps <30:
+            for file in files[:10]:  # Show first 3
                 print(f"    - {file}")
-            if len(files) > 3:
+        if fps >= 59:
+            for file in files[:10]:  # Show first 3
+                print(f"    - {file}")
+            if len(files) > 10:
                 print(f"    ... and {len(files) - 3} more")
 
     if not videos_60fps:

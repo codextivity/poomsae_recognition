@@ -13,6 +13,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 from configs.lstm_config import LSTMConfig
 from configs.paths import Paths
+from configs.policy_config import PolicyConfig
 
 
 # 22-class mapping: movement_id -> class_index
@@ -92,6 +93,31 @@ class SlidingWindowCreator:
         self.sequence_length = self.config.SEQUENCE_LENGTH
         self.stride = self.config.STRIDE
         self.num_classes = self.config.NUM_CLASSES  # 22
+        PolicyConfig.apply_profile()
+        self.policy = PolicyConfig
+
+    def _is_short_class(self, class_idx: int) -> bool:
+        return class_idx in self.policy.SHORT_CLASS_INDICES
+
+    def _keep_window_for_training(self, window: dict) -> bool:
+        """Apply switchable policy for selecting training windows."""
+        quality = window.get('quality', 'none')
+        class_idx = int(window.get('label', -1))
+        overlap_pct = float(window.get('percentage', 0.0))
+
+        if quality in ('high', 'medium'):
+            return True
+
+        if quality != 'low':
+            return False
+
+        if not self.policy.KEEP_LOW_QUALITY_WINDOWS:
+            return False
+
+        if self.policy.KEEP_LOW_FOR_SHORT_CLASSES_ONLY and not self._is_short_class(class_idx):
+            return False
+
+        return overlap_pct >= self.policy.LOW_QUALITY_MIN_OVERLAP_PCT
 
     def validate_annotations(self, annotations, video_name):
         """Validate annotations have expected movements"""
@@ -256,8 +282,19 @@ class SlidingWindowCreator:
 
         print(f"  Total: {len(windows)} | High: {len(high_quality)} | Med: {len(medium_quality)} | Low: {len(low_quality)}")
 
-        # Use high + medium quality for training
-        training_windows = high_quality + medium_quality
+        # Apply switchable policy for training selection
+        training_windows = [w for w in windows if self._keep_window_for_training(w)]
+        dropped_windows = len(windows) - len(training_windows)
+        kept_low = sum(1 for w in training_windows if w['quality'] == 'low')
+        kept_low_short = sum(1 for w in training_windows if w['quality'] == 'low' and self._is_short_class(w['label']))
+
+        print(
+            "  Policy:"
+            f" keep_low={self.policy.KEEP_LOW_QUALITY_WINDOWS},"
+            f" short_only={self.policy.KEEP_LOW_FOR_SHORT_CLASSES_ONLY},"
+            f" low_min_overlap={self.policy.LOW_QUALITY_MIN_OVERLAP_PCT:.1f}%"
+        )
+        print(f"  Selected: {len(training_windows)} (dropped: {dropped_windows}, kept_low: {kept_low}, kept_low_short: {kept_low_short})")
 
         if training_windows:
             X = np.array([w['keypoints'] for w in training_windows])
@@ -299,6 +336,7 @@ class SlidingWindowCreator:
         print(f"Sequence length: {self.sequence_length} frames")
         print(f"Stride: {self.stride} frames")
         print(f"Number of classes: {self.num_classes}")
+        print(f"Policy profile: {self.policy.PROFILE}")
         print(f"{'='*70}")
 
         total_windows = 0

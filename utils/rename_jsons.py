@@ -1,6 +1,6 @@
 import os
 
-folder = r"D:\All Docs\All Projects\Pycharm\poomsae_recognition\data\raw\annotations"  # change this
+folder = r"D:\All Docs\All Projects\Pycharm\poomsae_recognition\data\raw\JSON"  # change this
 
 for filename in os.listdir(folder):
     if filename.endswith(".json") and not filename.endswith("_annotations.json"):

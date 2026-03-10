@@ -101,7 +101,7 @@ class AnnotationDiagnostic:
         print(f"\nMovement numbers found: {sorted(movement_numbers)}")
 
         # Check for completeness (should be 1-20)
-        expected = set(range(1, 21))
+        expected = set(range(1, 23))
         found = set(movement_numbers)
 
         missing = expected - found

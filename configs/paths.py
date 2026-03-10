@@ -9,7 +9,7 @@ class Paths:
     # Data directories
     DATA_ROOT = ROOT / 'data'
     RAW_VIDEOS = DATA_ROOT / 'raw' / 'videos'
-    RAW_ANNOTATIONS = DATA_ROOT / 'raw' / 'annotations'
+    RAW_ANNOTATIONS = DATA_ROOT / 'raw' / 'JSON'
 
     PROCESSED_ROOT = DATA_ROOT / 'processed'
     KEYPOINTS_DIR = PROCESSED_ROOT / 'keypoints'

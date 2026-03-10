@@ -193,4 +193,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-#python drive_download_videos.py https://drive.google.com/drive/folders/1TgFepC-Fa5EkqNyUhfkXeqrHSwop9K23 "D:\All Docs\All Projects\Pycharm\poomsae_recognition\data\raw\videos"
+#python drive_download_videos.py https://drive.google.com/drive/folders/1TgFepC-Fa5EkqNyUhfkXeqrHSwop9K23 "D:\All Docs\All Projects\Pycharm\poomsae_recognition\data\raw\vdo"

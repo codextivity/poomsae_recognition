@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, random_split, WeightedRandomSampler
 import numpy as np
 from pathlib import Path
+from configs.policy_config import PolicyConfig
 
 # Short movement classes that need oversampling
 SHORT_MOVEMENT_CLASSES = [6, 12, 14, 17]  # 6_1, 12_1, 14_1, 16_1
@@ -233,6 +234,7 @@ def create_dataloaders(data_dir, batch_size=32, train_split=0.7, val_split=0.15,
         train_loader, val_loader, test_loader
     """
     data_dir = Path(data_dir)
+    PolicyConfig.apply_profile()
 
     # Find all window files
     window_files = list(data_dir.glob('*_windows.npz'))
@@ -271,12 +273,19 @@ def create_dataloaders(data_dir, batch_size=32, train_split=0.7, val_split=0.15,
         # Get labels for training samples
         train_indices = train_dataset.indices
         train_labels = full_dataset.y[train_indices]
+        train_metadata = [full_dataset.metadata[i] for i in train_indices]
 
         # Calculate sample weights (higher for short movements)
         sample_weights = np.ones(len(train_labels))
         for i, label in enumerate(train_labels):
-            if label in SHORT_MOVEMENT_CLASSES:
-                sample_weights[i] = 3.0  # 3x more likely to be sampled
+            if int(label) in PolicyConfig.SHORT_CLASS_INDICES:
+                sample_weights[i] *= float(PolicyConfig.SHORT_CLASS_WEIGHT_MULTIPLIER)
+
+            if PolicyConfig.USE_QUALITY_AWARE_SAMPLING:
+                quality_raw = train_metadata[i].get('quality', 'none')
+                quality = str(quality_raw).strip().lower()
+                quality_weight = PolicyConfig.QUALITY_WEIGHT_MULTIPLIERS.get(quality, 1.0)
+                sample_weights[i] *= float(quality_weight)
 
         sampler = WeightedRandomSampler(
             weights=sample_weights,
@@ -285,10 +294,16 @@ def create_dataloaders(data_dir, batch_size=32, train_split=0.7, val_split=0.15,
         )
         shuffle = False  # Can't shuffle with sampler
 
-        short_count = sum(1 for l in train_labels if l in SHORT_MOVEMENT_CLASSES)
+        short_count = sum(1 for l in train_labels if int(l) in PolicyConfig.SHORT_CLASS_INDICES)
         print(f"\n[OK] Oversampling enabled for short movements")
+        print(f"  Policy profile: {PolicyConfig.PROFILE}")
         print(f"  Short movement samples: {short_count} ({100*short_count/len(train_labels):.1f}%)")
-        print(f"  Short classes: {SHORT_MOVEMENT_CLASSES}")
+        print(f"  Short class multiplier: {PolicyConfig.SHORT_CLASS_WEIGHT_MULTIPLIER}")
+        print(f"  Short classes: {sorted(PolicyConfig.SHORT_CLASS_INDICES)}")
+        if PolicyConfig.USE_QUALITY_AWARE_SAMPLING:
+            print(f"  Quality-aware sampling: ON ({PolicyConfig.QUALITY_WEIGHT_MULTIPLIERS})")
+        else:
+            print("  Quality-aware sampling: OFF")
 
     # Create dataloaders
     train_loader = DataLoader(

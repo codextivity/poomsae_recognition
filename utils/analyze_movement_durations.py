@@ -286,8 +286,8 @@ class MovementDurationAnalyzer:
 
     def make_recommendations(self, all_stats, mean, median):
         """Make simple recommendations (same idea as your original)"""
-        current_window = 32
-        current_stride = 5
+        current_window = 24
+        current_stride = 2
 
         print("Current Settings:")
         print(f"  Window size: {current_window} frames ({current_window / self.fps:.1f}s @ {int(self.fps)}fps)")

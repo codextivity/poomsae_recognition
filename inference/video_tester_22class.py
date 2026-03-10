@@ -29,6 +29,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from models.lstm_classifier import PoomsaeLSTM
 from configs.lstm_config import LSTMConfig
 from configs.paths import Paths
+from configs.policy_config import PolicyConfig
 from preprocessing.create_windows import CLASS_NAMES, CLASS_MAPPING
 
 
@@ -41,6 +42,8 @@ class VideoTester:
     def __init__(self, model_path, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
+        PolicyConfig.apply_profile()
+        self.policy = PolicyConfig
 
         # Load config
         self.config = LSTMConfig()
@@ -100,6 +103,8 @@ class VideoTester:
 
         # Skip timing
         self.skip_wait_seconds = 2.0           # Wait time before allowing skip
+        if not self.policy.ALLOW_FUTURE_SKIP:
+            print("Policy: future skip disabled")
 
         # ========================================
         # TRACKING STATE
@@ -249,6 +254,8 @@ class VideoTester:
                 # Expected first movement
                 return self._try_confirm(predicted, confidence, frame_num, is_expected=True)
             elif predicted > 0 and confidence > self.conf_threshold_skip:
+                if not self.policy.ALLOW_FUTURE_SKIP:
+                    return None, "Skip disabled by policy (waiting for 0_1)"
                 # High confidence future movement - might have missed 0_1
                 confirmed = self._try_confirm(predicted, confidence, frame_num, is_expected=False)
                 if confirmed[0] is not None:
@@ -288,6 +295,8 @@ class VideoTester:
         # RULE 7: Future movement - slow accept with skip
         # ========================================
         if predicted > self.expected_next:
+            if not self.policy.ALLOW_FUTURE_SKIP:
+                return None, f"Skip disabled (expected {self.expected_next})"
             time_since_last = (frame_num - self.last_detection_frame) / self.fps
 
             # Must wait before allowing skip
