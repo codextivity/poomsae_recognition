@@ -11,6 +11,8 @@ Features:
 Usage:
     python test_on_video_v2.py --video path/to/video.mp4
     python test_on_video_v2.py --video path/to/video.mp4 --save-video --output output.mp4
+    python test_on_video_v2.py --webcam --camera 0
+    python test_on_video_v2.py --video path/to/video.mp4 --raw-mode --raw-conf-threshold 0.4
 """
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -39,11 +41,15 @@ class VideoTester:
     # Short movement classes (faster detection needed)
     SHORT_MOVEMENT_CLASSES = [6, 12, 14, 17]  # 6_1, 12_1, 14_1, 16_1
 
-    def __init__(self, model_path, device='cuda'):
+    def __init__(self, model_path, device='cuda', raw_mode=False, raw_conf_threshold=0.0, raw_smoothing=3):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         PolicyConfig.apply_profile()
         self.policy = PolicyConfig
+        self.raw_mode = bool(raw_mode)
+        self.raw_conf_threshold = float(raw_conf_threshold)
+        self.raw_smoothing = max(1, int(raw_smoothing))
+        self.raw_history = deque(maxlen=self.raw_smoothing)
 
         # Load config
         self.config = LSTMConfig()
@@ -90,16 +96,25 @@ class VideoTester:
         # ========================================
 
         # Confirmation thresholds (frames needed to confirm detection)
-        self.confirm_frames_expected = 5       # Expected movement: fast accept
+        self.confirm_frames_expected = 7       # Expected movement: conservative accept
         self.confirm_frames_short = 5          # Short movements: fast accept
         self.confirm_frames_normal = 10        # Normal movements: standard
         self.confirm_frames_future = 15        # Future movement (skip): slow accept
 
         # Confidence thresholds
-        self.conf_threshold_expected = 0.35    # Low threshold for expected (handles 0_1/19_1 confusion)
+        self.conf_threshold_expected = 0.50    # Stricter expected threshold for cleaner transitions
+        self.conf_threshold_boundary = 0.35    # For start/end pose confusion (0_1 vs 19_1)
         self.conf_threshold_short = 0.80       # Higher for short movements
         self.conf_threshold_normal = 0.60      # Normal threshold
         self.conf_threshold_skip = 0.85        # High threshold before skipping
+
+        # Transition timing guard to prevent early switching
+        self.min_hold_seconds_normal = 0.45
+        self.min_hold_seconds_short = 0.30
+
+        # Webcam-only startup fallback (keeps video behavior unchanged)
+        self.webcam_force_start_enabled = True
+        self.webcam_force_start_after_seconds = 5.0
 
         # Skip timing
         self.skip_wait_seconds = 2.0           # Wait time before allowing skip
@@ -128,6 +143,12 @@ class VideoTester:
 
         # FPS (set during processing)
         self.fps = 30.0
+        self.runtime_mode = 'video'
+        if self.raw_mode:
+            print(
+                "Raw mode enabled: sequence validation bypassed "
+                f"(conf>={self.raw_conf_threshold:.2f}, smoothing={self.raw_smoothing})"
+            )
 
     def load_normalization_stats(self):
         """Load normalization stats from training"""
@@ -210,7 +231,7 @@ class VideoTester:
         """Get confidence threshold for a movement"""
         # Special case: 0_1 and 19_1 have low confidence due to similar poses
         if movement in [0, 21]:
-            return self.conf_threshold_expected
+            return self.conf_threshold_boundary
 
         if is_expected:
             return self.conf_threshold_expected
@@ -220,6 +241,12 @@ class VideoTester:
             return self.conf_threshold_skip
         else:
             return self.conf_threshold_normal
+
+    def _get_min_hold_seconds_for_current(self):
+        """Minimum time the current movement should hold before switching."""
+        if self.current_movement in self.SHORT_MOVEMENT_CLASSES:
+            return self.min_hold_seconds_short
+        return self.min_hold_seconds_normal
 
     def validate_movement(self, predicted, confidence, frame_num):
         """
@@ -253,6 +280,14 @@ class VideoTester:
             if predicted == 0:
                 # Expected first movement
                 return self._try_confirm(predicted, confidence, frame_num, is_expected=True)
+            elif (
+                self.runtime_mode == 'webcam'
+                and self.webcam_force_start_enabled
+                and current_time >= self.webcam_force_start_after_seconds
+            ):
+                # Webcam can be noisy at startup; force-confirm 0_1 after warmup.
+                forced_conf = max(confidence, self.conf_threshold_boundary + 0.01)
+                return self._try_confirm(0, forced_conf, frame_num, is_expected=True)
             elif predicted > 0 and confidence > self.conf_threshold_skip:
                 if not self.policy.ALLOW_FUTURE_SKIP:
                     return None, "Skip disabled by policy (waiting for 0_1)"
@@ -289,6 +324,15 @@ class VideoTester:
         # RULE 6: Expected movement - fast accept
         # ========================================
         if predicted == self.expected_next:
+            # Guard: don't switch too early while current movement is still unfolding.
+            if self.current_movement is not None and self.movement_start_frame is not None:
+                elapsed = (frame_num - self.movement_start_frame) / self.fps
+                required = self._get_min_hold_seconds_for_current()
+                if elapsed < required:
+                    # Reset candidate so transition requires fresh consecutive evidence
+                    # after minimum hold time is reached.
+                    self._reset_candidate()
+                    return None, f"Hold current movement ({elapsed:.2f}s / {required:.2f}s)"
             return self._try_confirm(predicted, confidence, frame_num, is_expected=True)
 
         # ========================================
@@ -314,6 +358,35 @@ class VideoTester:
             return confirmed
 
         return None, "Unknown state"
+
+    def select_movement(self, predicted, confidence, probs, frame_num):
+        """Select movement based on runtime mode (validated or raw)."""
+        if not self.raw_mode:
+            return self.validate_movement(predicted, confidence, frame_num)
+
+        if confidence < self.raw_conf_threshold:
+            return None, f"Raw low confidence {confidence:.1%} < {self.raw_conf_threshold:.1%}"
+
+        if self.raw_smoothing <= 1:
+            return predicted, "Raw direct"
+
+        self.raw_history.append(predicted)
+        if len(self.raw_history) < self.raw_smoothing:
+            return None, f"Raw buffering ({len(self.raw_history)}/{self.raw_smoothing})"
+
+        counts = {}
+        for p in self.raw_history:
+            counts[p] = counts.get(p, 0) + 1
+
+        max_count = max(counts.values())
+        # Tie-break with recency.
+        candidate = None
+        for p in reversed(self.raw_history):
+            if counts[p] == max_count:
+                candidate = p
+                break
+
+        return candidate, f"Raw smoothed ({max_count}/{self.raw_smoothing})"
 
     def _try_confirm(self, movement, confidence, frame_num, is_expected):
         """Try to confirm a movement detection"""
@@ -422,8 +495,10 @@ class VideoTester:
         # Detection count
         draw.text((10, 85), f"Detected: {len(self.detected_movements)}/22", font=font_medium, fill=(200, 200, 200))
 
-        # Expected next
-        if self.expected_next < 22:
+        # Expected next (or raw mode info)
+        if self.raw_mode:
+            draw.text((10, 115), "Raw mode: sequence validation OFF", font=font_small, fill=(255, 200, 120))
+        elif self.expected_next < 22:
             exp_name = self.class_names[self.expected_next]
             draw.text((10, 115), f"Expected: {exp_name}", font=font_small, fill=(150, 150, 255))
 
@@ -452,6 +527,8 @@ class VideoTester:
 
     def process_video(self, video_path, save_video=False, output_path='output.mp4', show_window=True):
         """Process video with sequential validation"""
+        self.runtime_mode = 'video'
+        self.raw_history.clear()
         video_path = Path(video_path)
         if not video_path.exists():
             print(f"Video not found: {video_path}")
@@ -467,7 +544,10 @@ class VideoTester:
         print(f"Resolution: {width}x{height}, FPS: {self.fps:.1f}, Frames: {total_frames}")
         print(f"Duration: {total_frames/self.fps:.1f}s")
         print(f"\n{'='*60}")
-        print("SEQUENTIAL VALIDATION ENABLED")
+        if self.raw_mode:
+            print("RAW MODE ENABLED (NO SEQUENCE VALIDATION)")
+        else:
+            print("SEQUENTIAL VALIDATION ENABLED")
         print(f"{'='*60}\n")
 
         writer = None
@@ -503,8 +583,8 @@ class VideoTester:
             if pred is not None:
                 last_conf = conf
 
-                # Validate with sequential constraints
-                valid_movement, status = self.validate_movement(pred, conf, frame_num)
+                # Choose movement (validated mode or raw mode)
+                valid_movement, status = self.select_movement(pred, conf, probs, frame_num)
 
                 if valid_movement is not None and valid_movement != self.current_movement:
                     # Save previous movement
@@ -563,6 +643,174 @@ class VideoTester:
 
         self.print_summary()
 
+    def process_webcam(
+        self,
+        camera_index=0,
+        save_video=False,
+        output_path='webcam_output.mp4',
+        show_window=True,
+        allow_future_skip=False
+    ):
+        """Process live webcam stream with the same 22-class validation."""
+        self.runtime_mode = 'webcam'
+        self.raw_history.clear()
+
+        # Webcam-only threshold tuning for more stable startup.
+        original_confirm_frames_expected = self.confirm_frames_expected
+        original_conf_threshold_expected = self.conf_threshold_expected
+        original_conf_threshold_boundary = self.conf_threshold_boundary
+        self.confirm_frames_expected = 5
+        self.conf_threshold_expected = 0.45
+        self.conf_threshold_boundary = 0.30
+
+        # Webcam is noisier than offline video; strict sequence is safer by default.
+        original_allow_future_skip = self.policy.ALLOW_FUTURE_SKIP
+        if not allow_future_skip and original_allow_future_skip:
+            self.policy.ALLOW_FUTURE_SKIP = False
+            print("Webcam strict mode: future skip disabled")
+        elif allow_future_skip:
+            self.policy.ALLOW_FUTURE_SKIP = True
+            print("Webcam mode: future skip enabled")
+
+        cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            print(f"Cannot open camera index {camera_index}")
+            print("Try another camera index, for example: --camera 1")
+            self.policy.ALLOW_FUTURE_SKIP = original_allow_future_skip
+            return
+
+        # Camera FPS is often unreliable on webcams; use a safe fallback.
+        cam_fps = cap.get(cv2.CAP_PROP_FPS)
+        self.fps = cam_fps if cam_fps and cam_fps > 1.0 else 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        print(f"\nWebcam mode (camera={camera_index})")
+        print(f"Resolution: {width}x{height}, FPS: {self.fps:.1f}")
+        print(f"\n{'='*60}")
+        if self.raw_mode:
+            print("RAW MODE ENABLED (WEBCAM, NO SEQUENCE VALIDATION)")
+        else:
+            print("SEQUENTIAL VALIDATION ENABLED (WEBCAM)")
+        print("Controls: q/ESC quit, space pause/resume")
+        print(f"{'='*60}\n")
+
+        writer = None
+        if save_video:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, self.fps, (width, height))
+            print(f"Saving to: {output_path}")
+
+        if show_window:
+            cv2.namedWindow('Poomsae Recognition (Webcam)', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Poomsae Recognition (Webcam)', 1280, 720)
+
+        frame_num = 0
+        last_conf = 0.0
+        paused = False
+
+        while True:
+            if not paused:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Webcam frame read failed, stopping.")
+                    break
+
+                frame_num += 1
+
+                # Extract keypoints
+                kp_normalized, kp_raw = self.extract_keypoints(frame)
+                self.keypoint_buffer.append(kp_normalized)
+
+                # Draw skeleton
+                frame = self.draw_skeleton(frame, kp_raw)
+
+                # Predict
+                pred, conf, probs = self.predict()
+
+                if pred is not None:
+                    last_conf = conf
+
+                    # Choose movement (validated mode or raw mode)
+                    valid_movement, status = self.select_movement(pred, conf, probs, frame_num)
+
+                    if valid_movement is not None and valid_movement != self.current_movement:
+                        # Save previous movement
+                        if self.current_movement is not None and self.movement_start_frame is not None:
+                            duration = (frame_num - self.movement_start_frame) / self.fps
+                            self.detected_movements.append({
+                                'movement': self.current_movement,
+                                'name': self.class_names[self.current_movement],
+                                'start_frame': self.movement_start_frame,
+                                'end_frame': frame_num,
+                                'duration': duration,
+                                'confidence': conf
+                            })
+
+                        # Update current
+                        self.current_movement = valid_movement
+                        self.movement_start_frame = frame_num
+
+                        count = len(self.detected_movements) + 1
+                        print(f"[{frame_num/self.fps:.1f}s] {self.class_names[valid_movement]} ({conf*100:.1f}%) [{count}/22]")
+
+                # Draw info (no fixed total frames in webcam mode)
+                display_movement = self.current_movement
+                frame = self.draw_info(
+                    frame,
+                    display_movement,
+                    last_conf,
+                    probs if pred is not None else np.zeros(self.num_classes),
+                    frame_num,
+                    0
+                )
+
+                if writer:
+                    writer.write(frame)
+            else:
+                # Keep showing last frame while paused.
+                if frame is not None:
+                    cv2.putText(frame, "PAUSED", (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+
+            if show_window:
+                cv2.imshow('Poomsae Recognition (Webcam)', frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in [ord('q'), 27]:
+                    break
+                if key == ord(' '):
+                    paused = not paused
+            else:
+                # Headless mode still needs an escape route when not displaying.
+                if self.sequence_complete:
+                    break
+
+        # Handle last movement
+        if self.current_movement is not None and self.movement_start_frame is not None:
+            duration = (frame_num - self.movement_start_frame) / self.fps
+            self.detected_movements.append({
+                'movement': self.current_movement,
+                'name': self.class_names[self.current_movement],
+                'start_frame': self.movement_start_frame,
+                'end_frame': frame_num,
+                'duration': duration,
+                'confidence': 0
+            })
+
+        cap.release()
+        if writer:
+            writer.release()
+        if show_window:
+            cv2.destroyAllWindows()
+
+        # Restore policy state for any subsequent run in the same process.
+        self.policy.ALLOW_FUTURE_SKIP = original_allow_future_skip
+        self.confirm_frames_expected = original_confirm_frames_expected
+        self.conf_threshold_expected = original_conf_threshold_expected
+        self.conf_threshold_boundary = original_conf_threshold_boundary
+        self.runtime_mode = 'video'
+
+        self.print_summary()
+
     def print_summary(self):
         """Print detection summary"""
         print(f"\n{'='*60}")
@@ -588,7 +836,11 @@ class VideoTester:
                 print(f"  - {skip['name']} at {skip['time']:.1f}s ({skip['reason']})")
 
         print(f"\n{'='*60}")
-        if len(self.detected_movements) == 22:
+        if self.raw_mode:
+            unique_movs = sorted({mov['movement'] for mov in self.detected_movements})
+            print("STATUS: RAW MODE (sequence validation disabled)")
+            print(f"Unique classes seen: {len(unique_movs)}")
+        elif len(self.detected_movements) == 22:
             print("STATUS: All 22 movements detected!")
         elif self.sequence_complete:
             print(f"STATUS: Sequence complete with {len(self.detected_movements)} detections")
@@ -602,8 +854,19 @@ class VideoTester:
 
 def main():
     parser = argparse.ArgumentParser(description='Test Poomsae model on video')
-    parser.add_argument('--video', required=True, help='Path to video file')
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument('--video', help='Path to video file')
+    source_group.add_argument('--webcam', action='store_true', help='Use webcam stream as input')
+    parser.add_argument('--camera', type=int, default=0, help='Camera index for webcam mode (default: 0)')
+    parser.add_argument(
+        '--allow-future-skip-webcam',
+        action='store_true',
+        help='Enable future-skip jumps in webcam mode (default: disabled for strict sequence)'
+    )
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
+    parser.add_argument('--raw-mode', action='store_true', help='Bypass sequence validation and use raw model predictions')
+    parser.add_argument('--raw-conf-threshold', type=float, default=0.0, help='Min confidence for raw mode (default: 0.0)')
+    parser.add_argument('--raw-smoothing', type=int, default=3, help='Majority-vote window size in raw mode (default: 3)')
     parser.add_argument('--save-video', action='store_true', help='Save output video')
     parser.add_argument('--output', default='output_v2.mp4', help='Output video path')
     parser.add_argument('--no-display', action='store_true', help='Disable display window')
@@ -614,13 +877,28 @@ def main():
         print(f"Model not found: {model_path}")
         return
 
-    tester = VideoTester(model_path, args.device)
-    tester.process_video(
-        args.video,
-        save_video=args.save_video,
-        output_path=args.output,
-        show_window=not args.no_display
+    tester = VideoTester(
+        model_path,
+        args.device,
+        raw_mode=args.raw_mode,
+        raw_conf_threshold=args.raw_conf_threshold,
+        raw_smoothing=args.raw_smoothing
     )
+    if args.webcam:
+        tester.process_webcam(
+            camera_index=args.camera,
+            save_video=args.save_video,
+            output_path=args.output,
+            show_window=not args.no_display,
+            allow_future_skip=args.allow_future_skip_webcam
+        )
+    else:
+        tester.process_video(
+            args.video,
+            save_video=args.save_video,
+            output_path=args.output,
+            show_window=not args.no_display
+        )
 
 
 if __name__ == "__main__":

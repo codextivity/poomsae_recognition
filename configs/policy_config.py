@@ -11,7 +11,7 @@ class PolicyConfig:
     - "short_aware": keep more short-movement windows and use quality-aware sampling
     """
 
-    PROFILE = os.getenv("POOMSAE_POLICY_PROFILE", "baseline")
+    PROFILE = os.getenv("POOMSAE_POLICY_PROFILE", "short_aware")
 
     # 22-class indices for short movements: 6_1, 12_1, 14_1, 16_1
     SHORT_CLASS_INDICES = {6, 12, 14, 17}
@@ -55,7 +55,7 @@ class PolicyConfig:
             # Keep values exactly as written in this file.
             return
 
-        if profile == "short_aware":
+        if profile == "baseline":
             cls.KEEP_LOW_QUALITY_WINDOWS = True
             cls.KEEP_LOW_FOR_SHORT_CLASSES_ONLY = True
             cls.LOW_QUALITY_MIN_OVERLAP_PCT = 30.0
