@@ -4,7 +4,7 @@ Create Complete Reference Database with Images and Keypoints
 Features:
 - Reads annotation JSON for accurate movement boundaries
 - Trims first N frames from movements 1-21 (transition frames)
-- Extracts keypoints with RTMPose
+- Extracts keypoints with RTMPose or MediaPipe
 - Saves images in movement folders
 - Saves keypoints.npz in each folder
 - Creates master_22class.pkl reference database
@@ -38,25 +38,50 @@ class ReferenceCreator:
     NORM_CENTER_JOINT = 19  # Pelvis/hip center
     NORM_REF_JOINTS = [11, 12]  # Left hip, Right hip
 
-    def __init__(self, device='cuda', trim_start_frames=3):
+    def __init__(self, device='cuda', trim_start_frames=3, pose_backend='rtmpose'):
         """
         Args:
             device: 'cuda' or 'cpu'
             trim_start_frames: Number of frames to trim from start of movements 1-21
+            pose_backend: 'rtmpose' or 'mediapipe'
         """
         self.device = device
         self.trim_start_frames = trim_start_frames
+        self.pose_backend = str(pose_backend).strip().lower()
+        self.pose_estimator = None
+        self.mp_extractor = None
 
-        # Initialize RTMPose
+        self._init_pose_backend()
+
+    def _init_pose_backend(self):
+        """Initialize selected pose backend."""
+        if self.pose_backend == 'mediapipe':
+            try:
+                from preprocessing.extract_keypoints_mediapipe import MediaPipeExtractor
+                self.mp_extractor = MediaPipeExtractor(
+                    normalize=False,
+                    model_complexity=1,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    static_image_mode=False,
+                )
+                print("MediaPipe initialized")
+                return
+            except ImportError:
+                raise ImportError("mediapipe not installed. Run: pip install mediapipe")
+
+        if self.pose_backend != 'rtmpose':
+            raise ValueError(f"Unsupported pose backend: {self.pose_backend}")
+
         try:
             from rtmlib import BodyWithFeet
             self.pose_estimator = BodyWithFeet(
                 to_openpose=False,
                 mode='balanced',
                 backend='onnxruntime',
-                device=device
+                device=self.device
             )
-            print(f"RTMPose initialized (device: {device})")
+            print(f"RTMPose initialized (device: {self.device})")
         except ImportError:
             raise ImportError("rtmlib not installed. Run: pip install rtmlib")
 
@@ -94,6 +119,11 @@ class ReferenceCreator:
 
     def extract_keypoints_from_frame(self, frame):
         """Extract keypoints from a single frame"""
+        if self.pose_backend == 'mediapipe':
+            kp_raw = self.mp_extractor._extract_halpe26_from_frame(frame)
+            kp_norm = self.normalize_keypoints(kp_raw)
+            return kp_norm.astype(np.float32), kp_raw.astype(np.float32)
+
         keypoints, scores = self.pose_estimator(frame)
 
         if len(keypoints) > 0:
@@ -143,6 +173,7 @@ class ReferenceCreator:
             "version": "kp_v1",
             "movement_id": movement_id,
             "movement_name": movement_name,
+            "pose_backend": self.pose_backend,
             "fps": int(fps),
             "norm": {
                 "center": "hip",
@@ -186,6 +217,7 @@ class ReferenceCreator:
         print(f"Video: {video_path.name}")
         print(f"Annotation: {annotation_path.name}")
         print(f"Output: {output_dir}")
+        print(f"Pose backend: {self.pose_backend}")
         print(f"Trim start frames: {self.trim_start_frames} (for movements 1-21)")
         print(f"{'='*70}\n")
 
@@ -252,6 +284,7 @@ class ReferenceCreator:
             'trim_start_frames': self.trim_start_frames,
             'class_names': CLASS_NAMES,
             'class_mapping': CLASS_MAPPING,
+            'pose_backend': self.pose_backend,
             'movements': []
         }
 
@@ -263,6 +296,7 @@ class ReferenceCreator:
             'width': width,
             'height': height,
             'trim_start_frames': self.trim_start_frames,
+            'pose_backend': self.pose_backend,
             'movements': []
         }
 
@@ -420,14 +454,45 @@ def main():
     parser.add_argument('--annotation', required=True, help='Annotation JSON file path')
     parser.add_argument('--output', default='compare/references', help='Output directory')
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
+    parser.add_argument(
+        '--pose-backend',
+        type=str,
+        default='rtmpose',
+        choices=['rtmpose', 'mediapipe'],
+        help='Pose backend for extracting reference keypoints'
+    )
     parser.add_argument('--trim', type=int, default=3,
                         help='Frames to trim from start of movements 1-21 (default: 3)')
 
     args = parser.parse_args()
 
-    creator = ReferenceCreator(device=args.device, trim_start_frames=args.trim)
+    creator = ReferenceCreator(
+        device=args.device,
+        trim_start_frames=args.trim,
+        pose_backend=args.pose_backend,
+    )
     creator.create_reference(args.video, args.annotation, args.output)
 
 
 if __name__ == "__main__":
     main()
+
+
+"""
+# 1) Reference (RTMPose)
+python compare/create_reference_complete.py --video "data/reference/annotations/P001.mp4" --annotation "data/reference/annotations/P001_annotations.json" --output "compare/references_rtmpose" --pose-backend rtmpose
+
+# 2) Reference (MediaPipe)
+python compare/create_reference_complete.py --video "data/reference/annotations/P001.mp4" --annotation "data/reference/annotations/P001_annotations.json" --output "compare/references_mediapipe" --pose-backend mediapipe
+
+# 3) Student process (RTMPose)
+python compare/process_student.py --video "data/reference/videos/P011.mp4" --output "compare/students_rtmpose/P011" --pose-backend rtmpose
+
+# 4) Student process (MediaPipe)
+python compare/process_student.py --video "data/reference/videos/P011.mp4" --output "compare/students_mediapipe/P011" --pose-backend mediapipe
+
+# 5) Compare (must match backend pairs)
+python compare/compare_with_reference.py --student "compare/students_rtmpose/P011" --reference "compare/references_rtmpose" --output "compare/students_rtmpose/P011/comparison.json"
+python compare/compare_with_reference.py --student "compare/students_mediapipe/P011" --reference "compare/references_mediapipe" --output "compare/students_mediapipe/P011/comparison.json"
+
+"""

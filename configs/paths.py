@@ -24,7 +24,7 @@ class Paths:
 
     # Model directories
     MODELS_DIR = ROOT / 'models'
-    CHECKPOINTS_DIR = ROOT / 'checkpoints/22_classes_model_v2_short_aware'
+    CHECKPOINTS_DIR = ROOT / 'checkpoints/22_classes_model_mediapipe'
     RTMPOSE_MODELS_DIR = CHECKPOINTS_DIR / 'rtmpose_models'
 
     # Results

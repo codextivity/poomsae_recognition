@@ -13,6 +13,8 @@ Usage:
     python test_on_video_v2.py --video path/to/video.mp4 --save-video --output output.mp4
     python test_on_video_v2.py --webcam --camera 0
     python test_on_video_v2.py --video path/to/video.mp4 --raw-mode --raw-conf-threshold 0.4
+    python test_on_video_v2.py --video path/to/video.mp4 --pose-backend mediapipe
+    python test_on_video_v2.py --video path/to/video.mp4 --pose-backend mediapipe --inference-profile mediapipe_strict
 """
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -41,7 +43,20 @@ class VideoTester:
     # Short movement classes (faster detection needed)
     SHORT_MOVEMENT_CLASSES = [6, 12, 14, 17]  # 6_1, 12_1, 14_1, 16_1
 
-    def __init__(self, model_path, device='cuda', raw_mode=False, raw_conf_threshold=0.0, raw_smoothing=3):
+    def __init__(
+        self,
+        model_path,
+        device='cuda',
+        raw_mode=False,
+        raw_conf_threshold=0.0,
+        raw_smoothing=3,
+        pose_backend='rtmpose',
+        stats_path=None,
+        inference_profile='auto',
+        resize_input=False,
+        resize_width=1280,
+        resize_height=720,
+    ):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         PolicyConfig.apply_profile()
@@ -50,6 +65,12 @@ class VideoTester:
         self.raw_conf_threshold = float(raw_conf_threshold)
         self.raw_smoothing = max(1, int(raw_smoothing))
         self.raw_history = deque(maxlen=self.raw_smoothing)
+        self.pose_backend = str(pose_backend).strip().lower()
+        self.stats_path = Path(stats_path) if stats_path else None
+        self.inference_profile = str(inference_profile).strip().lower()
+        self.resize_input = bool(resize_input)
+        self.resize_width = max(1, int(resize_width))
+        self.resize_height = max(1, int(resize_height))
 
         # Load config
         self.config = LSTMConfig()
@@ -69,18 +90,8 @@ class VideoTester:
             print(f"Model config: seq_len={mc.get('sequence_length')}, classes={mc.get('num_classes')}")
         print(f"Model loaded (epoch {checkpoint.get('epoch', '?')}, val_acc={checkpoint.get('best_val_acc', 0):.2f}%)")
 
-        # Initialize RTMPose
-        try:
-            from rtmlib import BodyWithFeet
-            self.pose_estimator = BodyWithFeet(
-                to_openpose=False,
-                mode='balanced',
-                backend='onnxruntime',
-                device='cuda' if device == 'cuda' else 'cpu'
-            )
-            print("RTMPose initialized")
-        except ImportError:
-            raise ImportError("rtmlib not installed. Run: pip install rtmlib")
+        # Initialize pose backend
+        self._init_pose_backend(device)
 
         # Load normalization stats
         self.load_normalization_stats()
@@ -111,6 +122,13 @@ class VideoTester:
         # Transition timing guard to prevent early switching
         self.min_hold_seconds_normal = 0.45
         self.min_hold_seconds_short = 0.30
+        # Recovery guard when strict mode stalls at short transitions.
+        self.short_expected_stall_seconds = 1.2
+        self.short_recovery_conf_threshold = 0.90
+        # Class-specific recovery overrides (seconds, confidence).
+        self.short_recovery_overrides = {}
+        # Class-specific expected short confidence overrides.
+        self.short_expected_conf_overrides = {}
 
         # Webcam-only startup fallback (keeps video behavior unchanged)
         self.webcam_force_start_enabled = True
@@ -118,6 +136,7 @@ class VideoTester:
 
         # Skip timing
         self.skip_wait_seconds = 2.0           # Wait time before allowing skip
+        self._apply_inference_profile()
         if not self.policy.ALLOW_FUTURE_SKIP:
             print("Policy: future skip disabled")
 
@@ -149,22 +168,91 @@ class VideoTester:
                 "Raw mode enabled: sequence validation bypassed "
                 f"(conf>={self.raw_conf_threshold:.2f}, smoothing={self.raw_smoothing})"
             )
+        if self.resize_input:
+            print(f"Input resize enabled: {self.resize_width}x{self.resize_height} (before keypoint extraction)")
 
     def load_normalization_stats(self):
         """Load normalization stats from training"""
-        stats_file = Paths.CHECKPOINTS_DIR / 'normalization_stats.pkl'
+        stats_file = self.stats_path if self.stats_path else (Paths.CHECKPOINTS_DIR / 'normalization_stats.pkl')
 
         if stats_file.exists():
             with open(stats_file, 'rb') as f:
                 stats = pickle.load(f)
             self.mean = stats['mean']
             self.std = stats['std']
-            print(f"Loaded normalization stats (samples={stats.get('num_samples', '?')})")
+            print(f"Loaded normalization stats from {stats_file} (samples={stats.get('num_samples', '?')})")
         else:
             print("WARNING: normalization_stats.pkl not found!")
             print("Run: python utils/save_normalization_stats.py")
             self.mean = np.zeros(78)
             self.std = np.ones(78)
+
+    def _init_pose_backend(self, device):
+        """Initialize selected pose backend."""
+        if self.pose_backend == 'mediapipe':
+            try:
+                from preprocessing.extract_keypoints_mediapipe import MediaPipeExtractor
+                self.mp_extractor = MediaPipeExtractor(
+                    normalize=False,
+                    model_complexity=1,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    static_image_mode=False,
+                )
+                self.pose_estimator = None
+                print("MediaPipe backend initialized")
+            except ImportError:
+                raise ImportError("mediapipe not installed. Run: pip install mediapipe")
+            return
+
+        # Default backend: RTMPose
+        try:
+            from rtmlib import BodyWithFeet
+            self.pose_estimator = BodyWithFeet(
+                to_openpose=False,
+                mode='balanced',
+                backend='onnxruntime',
+                device='cuda' if device == 'cuda' else 'cpu'
+            )
+            self.mp_extractor = None
+            print("RTMPose backend initialized")
+        except ImportError:
+            raise ImportError("rtmlib not installed. Run: pip install rtmlib")
+
+    def _apply_inference_profile(self):
+        """Apply runtime-only inference profile tuning."""
+        profile = self.inference_profile
+        if profile == 'auto':
+            profile = 'mediapipe_strict' if self.pose_backend == 'mediapipe' else 'default'
+
+        if profile == 'mediapipe_strict':
+            # Keep short_aware training behavior, but tighten runtime transitions
+            # for noisier MediaPipe frame-by-frame outputs.
+            self.policy.ALLOW_SKIP_BY_ONE = False
+            self.policy.ALLOW_FUTURE_SKIP = False
+            self.confirm_frames_expected = 6
+            self.confirm_frames_short = 2
+            self.confirm_frames_future = 20
+            self.conf_threshold_short = 0.65
+            self.conf_threshold_skip = 0.90
+            self.min_hold_seconds_normal = 0.60
+            self.min_hold_seconds_short = 0.40
+            self.skip_wait_seconds = 2.5
+            self.short_expected_stall_seconds = 1.6
+            self.short_recovery_conf_threshold = 0.90
+            self.short_expected_conf_overrides = {
+                12: 0.55,  # class 12_1
+            }
+            # 12_1 is frequently brief/noisy; delay recovery so real detection
+            # has more chance before we skip it.
+            self.short_recovery_overrides = {
+                12: (2.2, 0.90),  # class 12_1
+            }
+            print("Inference profile: mediapipe_strict")
+            return
+
+        # default
+        print("Inference profile: default")
 
     def normalize_keypoints(self, keypoints):
         """Normalize keypoints: hip-centered + height-scaled"""
@@ -190,6 +278,12 @@ class VideoTester:
 
     def extract_keypoints(self, frame):
         """Extract and normalize keypoints from frame"""
+        if self.pose_backend == 'mediapipe':
+            # MediaPipe extractor returns HALPE26-compatible keypoints in pixel-space.
+            kp = self.mp_extractor._extract_halpe26_from_frame(frame)
+            kp_normalized = self.normalize_keypoints(kp)
+            return kp_normalized, kp.copy()
+
         keypoints, scores = self.pose_estimator(frame)
 
         if len(keypoints) > 0:
@@ -197,6 +291,16 @@ class VideoTester:
             kp_normalized = self.normalize_keypoints(kp)
             return kp_normalized, kp.copy()
         return np.zeros((26, 3)), np.zeros((26, 3))
+
+    def _prepare_frame_for_extraction(self, frame):
+        """Optionally resize frame before pose/keypoint extraction."""
+        if not self.resize_input or frame is None:
+            return frame
+
+        if frame.shape[1] == self.resize_width and frame.shape[0] == self.resize_height:
+            return frame
+
+        return cv2.resize(frame, (self.resize_width, self.resize_height), interpolation=cv2.INTER_LINEAR)
 
     def predict(self):
         """Make prediction from current keypoint buffer"""
@@ -218,14 +322,14 @@ class VideoTester:
 
     def get_confirmation_threshold(self, movement, is_expected):
         """Get number of frames needed to confirm a movement"""
+        # Short movements should confirm faster, especially when expected.
+        if movement in self.SHORT_MOVEMENT_CLASSES:
+            return self.confirm_frames_short if is_expected else self.confirm_frames_future
         if is_expected:
             return self.confirm_frames_expected
-        elif movement in self.SHORT_MOVEMENT_CLASSES:
-            return self.confirm_frames_short
-        elif movement > self.expected_next:
+        if movement > self.expected_next:
             return self.confirm_frames_future
-        else:
-            return self.confirm_frames_normal
+        return self.confirm_frames_normal
 
     def get_confidence_threshold(self, movement, is_expected):
         """Get confidence threshold for a movement"""
@@ -233,14 +337,16 @@ class VideoTester:
         if movement in [0, 21]:
             return self.conf_threshold_boundary
 
+        # Short movements use a dedicated threshold, including expected short moves.
+        if movement in self.SHORT_MOVEMENT_CLASSES:
+            if is_expected:
+                return self.short_expected_conf_overrides.get(movement, self.conf_threshold_short)
+            return self.conf_threshold_skip
         if is_expected:
             return self.conf_threshold_expected
-        elif movement in self.SHORT_MOVEMENT_CLASSES:
-            return self.conf_threshold_short
-        elif movement > self.expected_next:
+        if movement > self.expected_next:
             return self.conf_threshold_skip
-        else:
-            return self.conf_threshold_normal
+        return self.conf_threshold_normal
 
     def _get_min_hold_seconds_for_current(self):
         """Minimum time the current movement should hold before switching."""
@@ -340,6 +446,28 @@ class VideoTester:
         # ========================================
         if predicted > self.expected_next:
             if not self.policy.ALLOW_FUTURE_SKIP:
+                # Strict recovery for short expected movements:
+                # if the model keeps missing a short movement for a while, allow
+                # one-step recovery only when next movement is very confident.
+                if (
+                    self.expected_next in self.SHORT_MOVEMENT_CLASSES
+                    and predicted == self.expected_next + 1
+                ):
+                    time_since_last = (frame_num - self.last_detection_frame) / self.fps
+                    rec_stall_sec = self.short_expected_stall_seconds
+                    rec_conf_th = self.short_recovery_conf_threshold
+                    override = self.short_recovery_overrides.get(self.expected_next)
+                    if override is not None:
+                        rec_stall_sec, rec_conf_th = override
+                    if (
+                        time_since_last >= rec_stall_sec
+                        and confidence >= rec_conf_th
+                    ):
+                        skipped_idx = self.expected_next
+                        confirmed = self._try_confirm(predicted, confidence, frame_num, is_expected=True)
+                        if confirmed[0] is not None:
+                            self._add_skipped(skipped_idx, current_time, "Short-transition recovery")
+                        return confirmed
                 return None, f"Skip disabled (expected {self.expected_next})"
             time_since_last = (frame_num - self.last_detection_frame) / self.fps
 
@@ -539,9 +667,13 @@ class VideoTester:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        proc_width = self.resize_width if self.resize_input else width
+        proc_height = self.resize_height if self.resize_input else height
 
         print(f"\nProcessing: {video_path.name}")
         print(f"Resolution: {width}x{height}, FPS: {self.fps:.1f}, Frames: {total_frames}")
+        if self.resize_input:
+            print(f"Processing resolution: {proc_width}x{proc_height} (resized before extraction)")
         print(f"Duration: {total_frames/self.fps:.1f}s")
         print(f"\n{'='*60}")
         if self.raw_mode:
@@ -553,7 +685,7 @@ class VideoTester:
         writer = None
         if save_video:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, self.fps, (width, height))
+            writer = cv2.VideoWriter(output_path, fourcc, self.fps, (proc_width, proc_height))
             print(f"Saving to: {output_path}")
 
         if show_window:
@@ -569,6 +701,7 @@ class VideoTester:
                 break
 
             frame_num += 1
+            frame = self._prepare_frame_for_extraction(frame)
 
             # Extract keypoints
             kp_normalized, kp_raw = self.extract_keypoints(frame)
@@ -684,9 +817,13 @@ class VideoTester:
         self.fps = cam_fps if cam_fps and cam_fps > 1.0 else 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        proc_width = self.resize_width if self.resize_input else width
+        proc_height = self.resize_height if self.resize_input else height
 
         print(f"\nWebcam mode (camera={camera_index})")
         print(f"Resolution: {width}x{height}, FPS: {self.fps:.1f}")
+        if self.resize_input:
+            print(f"Processing resolution: {proc_width}x{proc_height} (resized before extraction)")
         print(f"\n{'='*60}")
         if self.raw_mode:
             print("RAW MODE ENABLED (WEBCAM, NO SEQUENCE VALIDATION)")
@@ -698,7 +835,7 @@ class VideoTester:
         writer = None
         if save_video:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, self.fps, (width, height))
+            writer = cv2.VideoWriter(output_path, fourcc, self.fps, (proc_width, proc_height))
             print(f"Saving to: {output_path}")
 
         if show_window:
@@ -717,6 +854,7 @@ class VideoTester:
                     break
 
                 frame_num += 1
+                frame = self._prepare_frame_for_extraction(frame)
 
                 # Extract keypoints
                 kp_normalized, kp_raw = self.extract_keypoints(frame)
@@ -864,25 +1002,51 @@ def main():
         help='Enable future-skip jumps in webcam mode (default: disabled for strict sequence)'
     )
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
+    parser.add_argument(
+        '--pose-backend',
+        type=str,
+        default='rtmpose',
+        choices=['rtmpose', 'mediapipe'],
+        help='Pose keypoint backend for runtime extraction'
+    )
+    parser.add_argument(
+        '--inference-profile',
+        type=str,
+        default='auto',
+        choices=['auto', 'default', 'mediapipe_strict'],
+        help='Runtime sequence-validation profile (auto applies mediapipe_strict when using MediaPipe)'
+    )
+    parser.add_argument('--model-path', type=str, default='', help='Optional explicit model checkpoint path')
+    parser.add_argument('--stats-path', type=str, default='', help='Optional explicit normalization stats path')
     parser.add_argument('--raw-mode', action='store_true', help='Bypass sequence validation and use raw model predictions')
     parser.add_argument('--raw-conf-threshold', type=float, default=0.0, help='Min confidence for raw mode (default: 0.0)')
     parser.add_argument('--raw-smoothing', type=int, default=3, help='Majority-vote window size in raw mode (default: 3)')
+    parser.add_argument('--resize-input', action='store_true', help='Resize frames before keypoint extraction')
+    parser.add_argument('--resize-width', type=int, default=1280, help='Pre-extraction resize width (default: 1280)')
+    parser.add_argument('--resize-height', type=int, default=720, help='Pre-extraction resize height (default: 720)')
     parser.add_argument('--save-video', action='store_true', help='Save output video')
     parser.add_argument('--output', default='output_v2.mp4', help='Output video path')
     parser.add_argument('--no-display', action='store_true', help='Disable display window')
     args = parser.parse_args()
 
-    model_path = Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth'
+    model_path = Path(args.model_path) if args.model_path else (Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth')
     if not model_path.exists():
         print(f"Model not found: {model_path}")
         return
+    stats_path = Path(args.stats_path) if args.stats_path else None
 
     tester = VideoTester(
         model_path,
         args.device,
         raw_mode=args.raw_mode,
         raw_conf_threshold=args.raw_conf_threshold,
-        raw_smoothing=args.raw_smoothing
+        raw_smoothing=args.raw_smoothing,
+        pose_backend=args.pose_backend,
+        stats_path=stats_path,
+        inference_profile=args.inference_profile,
+        resize_input=args.resize_input,
+        resize_width=args.resize_width,
+        resize_height=args.resize_height,
     )
     if args.webcam:
         tester.process_webcam(

@@ -39,9 +39,18 @@ class StudentProcessor:
     NORM_CENTER_JOINT = 19  # Pelvis/hip center
     NORM_REF_JOINTS = [11, 12]  # Left hip, Right hip
 
-    def __init__(self, model_path, device='cuda', trim_start_frames=3):
+    def __init__(
+        self,
+        model_path,
+        device='cuda',
+        trim_start_frames=3,
+        pose_backend='rtmpose',
+        stats_path=None,
+    ):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.trim_start_frames = trim_start_frames
+        self.pose_backend = str(pose_backend).strip().lower()
+        self.stats_path = Path(stats_path) if stats_path else None
         print(f"Using device: {self.device}")
 
         # Load config
@@ -57,18 +66,10 @@ class StudentProcessor:
         self.model.eval()
         print(f"Model loaded (epoch {checkpoint.get('epoch', '?')}, val_acc={checkpoint.get('best_val_acc', 0):.2f}%)")
 
-        # Initialize RTMPose
-        try:
-            from rtmlib import BodyWithFeet
-            self.pose_estimator = BodyWithFeet(
-                to_openpose=False,
-                mode='balanced',
-                backend='onnxruntime',
-                device='cuda' if device == 'cuda' else 'cpu'
-            )
-            print("RTMPose initialized")
-        except ImportError:
-            raise ImportError("rtmlib not installed. Run: pip install rtmlib")
+        # Initialize pose backend
+        self.pose_estimator = None
+        self.mp_extractor = None
+        self._init_pose_backend(device)
 
         # Load normalization stats
         self.load_normalization_stats()
@@ -95,6 +96,38 @@ class StudentProcessor:
         # Tracking state
         self.reset_state()
 
+    def _init_pose_backend(self, device):
+        """Initialize selected pose backend."""
+        if self.pose_backend == 'mediapipe':
+            try:
+                from preprocessing.extract_keypoints_mediapipe import MediaPipeExtractor
+                self.mp_extractor = MediaPipeExtractor(
+                    normalize=False,
+                    model_complexity=1,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    static_image_mode=False,
+                )
+                print("MediaPipe initialized")
+                return
+            except ImportError:
+                raise ImportError("mediapipe not installed. Run: pip install mediapipe")
+
+        if self.pose_backend != 'rtmpose':
+            raise ValueError(f"Unsupported pose backend: {self.pose_backend}")
+
+        try:
+            from rtmlib import BodyWithFeet
+            self.pose_estimator = BodyWithFeet(
+                to_openpose=False,
+                mode='balanced',
+                backend='onnxruntime',
+                device='cuda' if device == 'cuda' else 'cpu'
+            )
+            print("RTMPose initialized")
+        except ImportError:
+            raise ImportError("rtmlib not installed. Run: pip install rtmlib")
+
     def reset_state(self):
         """Reset all tracking state"""
         self.expected_next = 0
@@ -118,16 +151,16 @@ class StudentProcessor:
 
     def load_normalization_stats(self):
         """Load normalization stats from training"""
-        stats_file = Paths.CHECKPOINTS_DIR / 'normalization_stats.pkl'
+        stats_file = self.stats_path if self.stats_path else (Paths.CHECKPOINTS_DIR / 'normalization_stats.pkl')
 
         if stats_file.exists():
             with open(stats_file, 'rb') as f:
                 stats = pickle.load(f)
             self.mean = stats['mean']
             self.std = stats['std']
-            print(f"Loaded normalization stats")
+            print(f"Loaded normalization stats from {stats_file}")
         else:
-            print("WARNING: normalization_stats.pkl not found!")
+            print(f"WARNING: normalization stats not found: {stats_file}")
             self.mean = np.zeros(78)
             self.std = np.ones(78)
 
@@ -155,6 +188,11 @@ class StudentProcessor:
 
     def extract_keypoints(self, frame):
         """Extract and normalize keypoints from frame"""
+        if self.pose_backend == 'mediapipe':
+            kp_raw = self.mp_extractor._extract_halpe26_from_frame(frame)
+            kp_norm = self.normalize_keypoints(kp_raw)
+            return kp_norm.astype(np.float32), kp_raw.astype(np.float32)
+
         keypoints, scores = self.pose_estimator(frame)
 
         if len(keypoints) > 0:
@@ -314,6 +352,7 @@ class StudentProcessor:
             "version": "kp_v1",
             "movement_id": movement_id,
             "movement_name": movement_name,
+            "pose_backend": self.pose_backend,
             "fps": int(fps),
             "norm": {
                 "center": "hip",
@@ -380,6 +419,7 @@ class StudentProcessor:
         print(f"Resolution: {width}x{height}, FPS: {self.fps:.1f}, Frames: {total_frames}")
         print(f"Duration: {total_frames/self.fps:.1f}s")
         print(f"Output: {output_dir}")
+        print(f"Pose backend: {self.pose_backend}")
         print(f"{'='*70}\n")
 
         # Create output directory
@@ -474,6 +514,7 @@ class StudentProcessor:
             'total_frames': total_frames,
             'width': width,
             'height': height,
+            'pose_backend': self.pose_backend,
             'num_detected': len(self.detected_movements),
             'num_skipped': len(self.skipped_movements),
             'movements': [],
@@ -594,18 +635,46 @@ def main():
     parser.add_argument('--video', required=True, help='Student video path')
     parser.add_argument('--output', required=True, help='Output directory')
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
+    parser.add_argument(
+        '--pose-backend',
+        type=str,
+        default='rtmpose',
+        choices=['rtmpose', 'mediapipe'],
+        help='Pose backend for student keypoint extraction'
+    )
+    parser.add_argument('--model-path', type=str, default='', help='Optional explicit model checkpoint path')
+    parser.add_argument('--stats-path', type=str, default='', help='Optional explicit normalization stats path')
     parser.add_argument('--trim', type=int, default=3, help='Frames to trim from start')
     parser.add_argument('--save-video', action='store_true', help='Save annotated video')
     parser.add_argument('--save-images', action='store_true', help='Save frame images')
 
     args = parser.parse_args()
 
-    model_path = Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth'
+    if args.model_path:
+        model_path = Path(args.model_path)
+    elif args.pose_backend == 'mediapipe':
+        model_path = Paths.CHECKPOINTS_DIR / '22_classes_model_mediapipe' / 'lstm_taegeuk1_best.pth'
+    else:
+        model_path = Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth'
+
     if not model_path.exists():
         print(f"Model not found: {model_path}")
         return
 
-    processor = StudentProcessor(model_path, args.device, args.trim)
+    if args.stats_path:
+        stats_path = Path(args.stats_path)
+    elif args.pose_backend == 'mediapipe':
+        stats_path = Paths.CHECKPOINTS_DIR / '22_classes_model_mediapipe' / 'normalization_stats.pkl'
+    else:
+        stats_path = Paths.CHECKPOINTS_DIR / 'normalization_stats.pkl'
+
+    processor = StudentProcessor(
+        model_path,
+        args.device,
+        args.trim,
+        pose_backend=args.pose_backend,
+        stats_path=stats_path,
+    )
     processor.process_video(
         args.video,
         args.output,
