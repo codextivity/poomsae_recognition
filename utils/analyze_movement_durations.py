@@ -123,38 +123,67 @@ class MovementDurationAnalyzer:
             except Exception:
                 start_time = 0.0
 
-            frame = int(ann.get("frame", 0))
-            segments.append({"id": movement_id, "start_time": start_time, "frame": frame})
+            try:
+                end_time_raw = ann.get("endTime", None)
+                end_time = float(end_time_raw) if end_time_raw not in (None, "") else None
+            except Exception:
+                end_time = None
+
+            try:
+                frame = int(ann.get("frame", 0))
+            except Exception:
+                frame = 0
+
+            try:
+                end_frame_raw = ann.get("endFrame", None)
+                end_frame = int(end_frame_raw) if end_frame_raw not in (None, "") else None
+            except Exception:
+                end_frame = None
+
+            segments.append({
+                "id": movement_id,
+                "start_time": start_time,
+                "end_time": end_time,
+                "frame": frame,
+                "end_frame": end_frame,
+            })
 
         # IMPORTANT: Sort by time, not by movement number
         segments.sort(key=lambda x: x["start_time"])
 
-        # Calculate durations: duration of each segment until next segment begins
-        for i in range(len(segments) - 1):
-            curr = segments[i]
-            nxt = segments[i + 1]
-            duration = nxt["start_time"] - curr["start_time"]
-            if duration >= 0:
+        # Prefer explicit end_time from the new annotation schema. Fall back to
+        # next start_time for the legacy start-only format.
+        for i, curr in enumerate(segments):
+            duration = None
+
+            if curr["end_time"] is not None:
+                duration = curr["end_time"] - curr["start_time"]
+            elif i < len(segments) - 1:
+                nxt = segments[i + 1]
+                duration = nxt["start_time"] - curr["start_time"]
+            elif curr["end_frame"] is not None and curr["frame"] >= 0:
+                frame_diff = curr["end_frame"] - curr["frame"] + 1
+                if frame_diff > 0:
+                    duration = frame_diff / self.fps
+
+            if duration is not None and duration >= 0:
                 self.all_durations[curr["id"]].append(duration)
 
-        # ---- FIX: include last movement duration (e.g., 19_1) using frames ----
-        # Without endTime/videoDuration, last segment duration cannot be exact.
-        # But we can estimate it from frame difference to the previous segment.
-        if len(segments) >= 2:
-            last = segments[-1]
-            prev = segments[-2]
-
-            frame_diff = last["frame"] - prev["frame"]
-            if frame_diff > 0:
-                last_duration = frame_diff / self.fps
-                self.all_durations[last["id"]].append(last_duration)
-
-        # Video duration (proxy): last annotation start time (same behavior as your original)
-        self.video_durations.append(segments[-1]["start_time"])
+        # Prefer explicit totalDuration from the file. Fall back to the old proxy
+        # behavior for legacy annotations.
+        try:
+            self.video_durations.append(float(data.get("totalDuration")))
+        except Exception:
+            self.video_durations.append(segments[-1]["start_time"])
 
     def analyze_all(self):
         """Analyze all annotation files"""
         annotation_files = sorted(self.annotations_dir.glob("*_annotations.json"))
+
+        # Newer exports may use plain .json names like G001_TG1_front.json
+        # instead of the older *_annotations.json pattern.
+        if not annotation_files:
+            annotation_files = sorted(self.annotations_dir.glob("*.json"))
 
         print(f"\n{'=' * 70}")
         print("MOVEMENT DURATION ANALYSIS")

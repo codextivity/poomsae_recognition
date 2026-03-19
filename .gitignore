@@ -87,6 +87,7 @@ chceckpoints/*
 utils/credentials.json
 utils/token.json
 checkpoints
+compare
 *.mp4
 *.json
 *.pth
