@@ -488,7 +488,8 @@ class PerformanceComparator:
         print(f"{'='*70}")
         print(f"Student: {student_results['video_name']}")
         print(f"Reference: {self.reference_index['video']}")
-        print(f"Detected movements: {student_results['num_detected']}/22")
+        total_reference_movements = len(self.reference_index.get('movements', []))
+        print(f"Detected movements: {student_results['num_detected']}/{total_reference_movements}")
         print(f"{'='*70}\n")
 
         # Comparison results

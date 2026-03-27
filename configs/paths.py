@@ -9,7 +9,7 @@ class Paths:
     # Data directories
     DATA_ROOT = ROOT / 'data'
     RAW_VIDEOS = DATA_ROOT / 'raw' / 'videos'
-    RAW_ANNOTATIONS = DATA_ROOT / 'raw' / 'annotations' / 'old'
+    RAW_ANNOTATIONS = DATA_ROOT / 'raw' / 'annotations'
 
     PROCESSED_ROOT = DATA_ROOT / 'processed'
     KEYPOINTS_DIR = PROCESSED_ROOT / 'keypoints'
@@ -24,7 +24,7 @@ class Paths:
 
     # Model directories
     MODELS_DIR = ROOT / 'models'
-    CHECKPOINTS_DIR = ROOT / 'checkpoints/22_classes_model_mediapipe'
+    CHECKPOINTS_DIR = ROOT / 'checkpoints/22_classes_model_rtmpose_2026_03_26_sq16_v2'
     RTMPOSE_MODELS_DIR = CHECKPOINTS_DIR / 'rtmpose_models'
 
     # Results

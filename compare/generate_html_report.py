@@ -430,7 +430,7 @@ def generate_html_report(comparison_path, output_path=None):
 
             <div class="summary-card">
                 <div class="summary-label">Movements Detected</div>
-                <div class="summary-value">{student.get('detected', 0)}/22</div>
+                <div class="summary-value">{student.get('detected', 0)}/{len(movements)}</div>
                 <div class="summary-subtext">Skipped: {student.get('skipped', 0)}</div>
             </div>
 

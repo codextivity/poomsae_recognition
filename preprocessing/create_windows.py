@@ -1,90 +1,24 @@
-"""
-Create sliding windows for LSTM training - 22 CLASS VERSION
+"""Create sliding windows for LSTM training using annotation-derived class metadata."""
 
-Handles annotation format: "X_Y_description" (e.g., "6_1_오른 지르기")
-Supports 22 classes including sub-movements (14_1, 14_2, 16_1, 16_2)
-"""
-import numpy as np
-import pickle
-from pathlib import Path
 import json
+import pickle
 import sys
+from pathlib import Path
+
+import numpy as np
 
 sys.path.append(str(Path(__file__).parent.parent))
+from configs.class_metadata import (
+    get_short_class_indices,
+    metadata_payload,
+    parse_movement_id,
+    resolve_annotation_file,
+    save_class_metadata_json,
+    build_class_metadata_from_annotation_files,
+)
 from configs.lstm_config import LSTMConfig
 from configs.paths import Paths
 from configs.policy_config import PolicyConfig
-
-
-# 22-class mapping: movement_id -> class_index
-CLASS_MAPPING = {
-    '0_1': 0,   # 기본준비
-    '1_1': 1,   # 왼 앞서기 왼 아래막기
-    '2_1': 2,   # 오른 앞서기 오른 지르기
-    '3_1': 3,   # 오른 앞서기 오른 아래막기
-    '4_1': 4,   # 왼 앞서기 왼 지르기
-    '5_1': 5,   # 왼 앞굽이 왼 아래막기
-    '6_1': 6,   # 오른 지르기 (SHORT)
-    '7_1': 7,   # 오른 앞서기 왼 안막기
-    '8_1': 8,   # 왼 앞서기 오른 지르기
-    '9_1': 9,   # 왼 앞서기 오른 안막기
-    '10_1': 10, # 오른 앞서기 왼 지르기
-    '11_1': 11, # 오른 앞굽이 오른 아래막기
-    '12_1': 12, # 왼 지르기 (SHORT)
-    '13_1': 13, # 왼 앞서기 왼 얼굴막기
-    '14_1': 14, # 오른발 앞차기 (SHORT)
-    '14_2': 15, # 오른 앞서기 오른 지르기
-    '15_1': 16, # 오른 앞서기 오른 얼굴막기
-    '16_1': 17, # 왼발 앞차기 (SHORT)
-    '16_2': 18, # 왼 앞서기 왼 지르기
-    '17_1': 19, # 왼 앞굽이 왼 아래막기
-    '18_1': 20, # 오른 앞굽이 오른 지르기(기합)
-    '19_1': 21, # 기본바로
-}
-
-CLASS_NAMES = [
-    '0_1_기본준비',
-    '1_1_왼 앞서기 왼 아래막기',
-    '2_1_오른 앞서기 오른 지르기',
-    '3_1_오른 앞서기 오른 아래막기',
-    '4_1_왼 앞서기 왼 지르기',
-    '5_1_왼 앞굽이 왼 아래막기',
-    '6_1_오른 지르기',
-    '7_1_오른 앞서기 왼 안막기',
-    '8_1_왼 앞서기 오른 지르기',
-    '9_1_왼 앞서기 오른 안막기',
-    '10_1_오른 앞서기 왼 지르기',
-    '11_1_오른 앞굽이 오른 아래막기',
-    '12_1_왼 지르기',
-    '13_1_왼 앞서기 왼 얼굴막기',
-    '14_1_오른발 앞차기',
-    '14_2_오른 앞서기 오른 지르기',
-    '15_1_오른 앞서기 오른 얼굴막기',
-    '16_1_왼발 앞차기',
-    '16_2_왼 앞서기 왼 지르기',
-    '17_1_왼 앞굽이 왼 아래막기',
-    '18_1_오른 앞굽이 오른 지르기(기합)',
-    '19_1_기본바로',
-]
-
-
-def parse_movement_id(movement_str: str) -> str:
-    """
-    Parse movement ID from format "X_Y_description"
-
-    Examples:
-        "6_1_오른 지르기" -> "6_1"
-        "14_2_오른 앞서기 오른 지르기" -> "14_2"
-    """
-    parts = str(movement_str).strip().split('_')
-
-    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-        return f"{int(parts[0])}_{int(parts[1])}"
-
-    if len(parts) >= 1 and parts[0].isdigit():
-        return f"{int(parts[0])}_1"
-
-    return movement_str
 
 
 class SlidingWindowCreator:
@@ -92,15 +26,25 @@ class SlidingWindowCreator:
         self.config = LSTMConfig()
         self.sequence_length = self.config.SEQUENCE_LENGTH
         self.stride = self.config.STRIDE
-        self.num_classes = self.config.NUM_CLASSES  # 22
         PolicyConfig.apply_profile()
         self.policy = PolicyConfig
 
-    def _is_short_class(self, class_idx: int) -> bool:
-        return class_idx in self.policy.SHORT_CLASS_INDICES
+        self.class_mapping = {}
+        self.class_names = []
+        self.num_classes = 0
+        self.short_class_indices = set()
 
-    def _keep_window_for_training(self, window: dict) -> bool:
-        """Apply switchable policy for selecting training windows."""
+    def _set_class_metadata(self, class_mapping, class_names):
+        self.class_mapping = dict(class_mapping)
+        self.class_names = list(class_names)
+        self.num_classes = len(self.class_mapping)
+        self.short_class_indices = get_short_class_indices(self.class_mapping, self.policy.SHORT_MOVEMENT_IDS)
+        self.policy.SHORT_CLASS_INDICES = set(self.short_class_indices)
+
+    def _is_short_class(self, class_idx):
+        return int(class_idx) in self.short_class_indices
+
+    def _keep_window_for_training(self, window):
         quality = window.get('quality', 'none')
         class_idx = int(window.get('label', -1))
         overlap_pct = float(window.get('percentage', 0.0))
@@ -120,111 +64,116 @@ class SlidingWindowCreator:
         return overlap_pct >= self.policy.LOW_QUALITY_MIN_OVERLAP_PCT
 
     def validate_annotations(self, annotations, video_name):
-        """Validate annotations have expected movements"""
-        movement_ids = set()
+        movement_ids = []
+        for ann in annotations:
+            mov_id = parse_movement_id(ann.get('movement', ''))
+            if mov_id:
+                movement_ids.append(mov_id)
+
+        if not movement_ids:
+            print(f"[!] {video_name}: no valid movement IDs found")
+            return False
+
+        unknown = sorted({mov_id for mov_id in movement_ids if mov_id not in self.class_mapping})
+        if unknown:
+            print(f"[!] {video_name}: Unknown movements: {unknown}")
+
+        return True
+
+    def _annotation_start_time(self, ann):
+        value = ann.get('startTime')
+        return float(value) if value is not None else None
+
+    def _annotation_end_time(self, ann):
+        value = ann.get('endTime')
+        if value is None or value == '':
+            return None
+        return float(value)
+
+    def _build_processed_annotations(self, annotations, keypoints, fps, video_name):
+        processed = []
 
         for ann in annotations:
             mov_id = parse_movement_id(ann.get('movement', ''))
-            movement_ids.add(mov_id)
+            if mov_id not in self.class_mapping:
+                print(f"[!] Unknown movement ID: {mov_id} in {video_name}")
+                continue
 
-        # Check all 22 classes are present
-        expected = set(CLASS_MAPPING.keys())
-        missing = expected - movement_ids
-        extra = movement_ids - expected
+            start_time = self._annotation_start_time(ann)
+            if start_time is None:
+                print(f"[!] Missing startTime for {ann.get('movement', mov_id)} in {video_name}")
+                continue
 
-        if missing:
-            print(f"[!] {video_name}: Missing movements: {sorted(missing)}")
-            # Don't fail - some videos might have slight variations
+            processed.append({
+                'movement': ann.get('movement', mov_id),
+                'movement_id': mov_id,
+                'class_idx': self.class_mapping[mov_id],
+                'startTime': start_time,
+                'endTime': self._annotation_end_time(ann),
+            })
 
-        if extra:
-            print(f"[!] {video_name}: Unknown movements: {sorted(extra)}")
+        processed.sort(key=lambda x: x['startTime'])
 
-        return True  # Continue processing even with warnings
+        video_end = len(keypoints) / fps if fps > 0 else 0.0
+        for i in range(len(processed)):
+            if processed[i]['endTime'] is not None:
+                continue
+            if i < len(processed) - 1:
+                processed[i]['endTime'] = processed[i + 1]['startTime']
+            else:
+                processed[i]['endTime'] = video_end
+
+        return processed
 
     def create_windows_from_keypoints(self, keypoints_path, annotations_path):
-        """Create sliding windows from full video keypoints"""
-        # Load keypoints
         with open(keypoints_path, 'rb') as f:
             data = pickle.load(f)
 
-        keypoints = data['keypoints']  # (num_frames, 26, 3)
+        keypoints = data['keypoints']
         fps = data['fps']
 
-        # Load annotations
-        with open(annotations_path, encoding='utf-8') as f:
+        with open(annotations_path, 'r', encoding='utf-8') as f:
             ann_data = json.load(f)
 
         annotations = ann_data['annotations']
         video_name = Path(keypoints_path).stem.replace('_keypoints', '')
-
-        # Validate
         self.validate_annotations(annotations, video_name)
 
-        # Process annotations
-        annotations_processed = []
-        for ann in annotations:
-            mov_id = parse_movement_id(ann.get('movement', ''))
+        annotations_processed = self._build_processed_annotations(annotations, keypoints, fps, video_name)
 
-            # Get class index from mapping
-            if mov_id not in CLASS_MAPPING:
-                print(f"[!] Unknown movement ID: {mov_id} in {video_name}")
-                continue
-
-            class_idx = CLASS_MAPPING[mov_id]
-
-            annotations_processed.append({
-                'movement': ann['movement'],
-                'movement_id': mov_id,
-                'class_idx': class_idx,
-                'startTime': float(ann['startTime']),
-            })
-
-        # Sort by start time
-        annotations_processed.sort(key=lambda x: x['startTime'])
-
-        # Add end times
-        for i in range(len(annotations_processed)):
-            if i < len(annotations_processed) - 1:
-                annotations_processed[i]['endTime'] = annotations_processed[i + 1]['startTime']
-            else:
-                annotations_processed[i]['endTime'] = len(keypoints) / fps
-
-        # Create sliding windows
         windows = []
-
         for start_frame in range(0, len(keypoints) - self.sequence_length, self.stride):
             end_frame = start_frame + self.sequence_length
-
             window_keypoints = keypoints[start_frame:end_frame]
 
             window_start_time = start_frame / fps
             window_end_time = end_frame / fps
             window_duration = self.sequence_length / fps
 
-            # Find label using majority vote
             label_info = self._majority_vote_label(
                 window_start_time,
                 window_end_time,
                 window_duration,
-                annotations_processed
+                annotations_processed,
             )
 
-            if label_info['class_idx'] is not None:
-                windows.append({
-                    'keypoints': window_keypoints,
-                    'label': label_info['class_idx'],
-                    'movement_id': label_info['movement_id'],
-                    'movement_name': label_info['movement'],
-                    'percentage': label_info['percentage'],
-                    'quality': label_info['quality'],
-                    'start_frame': start_frame,
-                    'end_frame': end_frame,
-                })
+            if label_info['class_idx'] is None:
+                continue
+
+            windows.append({
+                'keypoints': window_keypoints,
+                'label': label_info['class_idx'],
+                'movement_id': label_info['movement_id'],
+                'movement_name': label_info['movement'],
+                'percentage': label_info['percentage'],
+                'quality': label_info['quality'],
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+            })
 
         return windows
 
     def _majority_vote_label(self, window_start, window_end, window_duration, annotations):
-        """Calculate label using majority vote algorithm"""
         overlaps = {}
 
         for ann in annotations:
@@ -234,22 +183,19 @@ class SlidingWindowCreator:
             if overlap_start < overlap_end:
                 overlap_duration = overlap_end - overlap_start
                 percentage = (overlap_duration / window_duration) * 100
-
                 overlaps[ann['movement_id']] = {
                     'movement': ann['movement'],
                     'movement_id': ann['movement_id'],
                     'class_idx': ann['class_idx'],
-                    'percentage': percentage
+                    'percentage': percentage,
                 }
 
         if not overlaps:
-            return {'class_idx': None, 'movement_id': None, 'percentage': 0, 'quality': 'none'}
+            return {'class_idx': None, 'movement_id': None, 'percentage': 0.0, 'quality': 'none'}
 
-        # Find dominant movement
         dominant = max(overlaps.items(), key=lambda x: x[1]['percentage'])
         percentage = dominant[1]['percentage']
 
-        # Determine quality
         if percentage >= 70:
             quality = 'high'
         elif percentage >= 50:
@@ -262,160 +208,163 @@ class SlidingWindowCreator:
             'movement_id': dominant[1]['movement_id'],
             'class_idx': dominant[1]['class_idx'],
             'percentage': percentage,
-            'quality': quality
+            'quality': quality,
         }
 
     def process_video(self, keypoints_path, annotations_path, output_path):
-        """Process one video and save windows"""
-        print(f"\nProcessing {keypoints_path.name}...")
-
+        print(f"\nProcessing {Path(keypoints_path).name}...")
         windows = self.create_windows_from_keypoints(keypoints_path, annotations_path)
 
         if not windows:
-            print(f"[!] No windows created for {keypoints_path.name}")
+            print(f"[!] No windows created for {Path(keypoints_path).name}")
             return 0
 
-        # Separate by quality
         high_quality = [w for w in windows if w['quality'] == 'high']
         medium_quality = [w for w in windows if w['quality'] == 'medium']
         low_quality = [w for w in windows if w['quality'] == 'low']
 
         print(f"  Total: {len(windows)} | High: {len(high_quality)} | Med: {len(medium_quality)} | Low: {len(low_quality)}")
 
-        # Apply switchable policy for training selection
         training_windows = [w for w in windows if self._keep_window_for_training(w)]
         dropped_windows = len(windows) - len(training_windows)
         kept_low = sum(1 for w in training_windows if w['quality'] == 'low')
         kept_low_short = sum(1 for w in training_windows if w['quality'] == 'low' and self._is_short_class(w['label']))
 
         print(
-            "  Policy:"
-            f" keep_low={self.policy.KEEP_LOW_QUALITY_WINDOWS},"
-            f" short_only={self.policy.KEEP_LOW_FOR_SHORT_CLASSES_ONLY},"
-            f" low_min_overlap={self.policy.LOW_QUALITY_MIN_OVERLAP_PCT:.1f}%"
+            '  Policy:'
+            f' keep_low={self.policy.KEEP_LOW_QUALITY_WINDOWS},'
+            f' short_only={self.policy.KEEP_LOW_FOR_SHORT_CLASSES_ONLY},'
+            f' low_min_overlap={self.policy.LOW_QUALITY_MIN_OVERLAP_PCT:.1f}%'
         )
         print(f"  Selected: {len(training_windows)} (dropped: {dropped_windows}, kept_low: {kept_low}, kept_low_short: {kept_low_short})")
 
-        if training_windows:
-            X = np.array([w['keypoints'] for w in training_windows])
-            y = np.array([w['label'] for w in training_windows])
+        if not training_windows:
+            return 0
 
-            # Reshape: (N, seq_len, 26, 3) -> (N, seq_len, 78)
-            X_flat = X.reshape(X.shape[0], X.shape[1], -1)
+        X = np.array([w['keypoints'] for w in training_windows])
+        y = np.array([w['label'] for w in training_windows], dtype=np.int64)
+        X_flat = X.reshape(X.shape[0], X.shape[1], -1)
+        class_meta = metadata_payload(self.class_mapping, self.class_names, self.policy.SHORT_MOVEMENT_IDS)
 
-            np.savez_compressed(
-                output_path,
-                X=X_flat,
-                y=y,
-                movement_ids=[w['movement_id'] for w in training_windows],
-                movement_names=[w['movement_name'] for w in training_windows],
-                quality=[w['quality'] for w in training_windows],
-                percentage=[w['percentage'] for w in training_windows]
-            )
+        np.savez_compressed(
+            output_path,
+            X=X_flat,
+            y=y,
+            movement_ids=np.array([w['movement_id'] for w in training_windows], dtype=object),
+            movement_names=np.array([w['movement_name'] for w in training_windows], dtype=object),
+            quality=np.array([w['quality'] for w in training_windows], dtype=object),
+            percentage=np.array([w['percentage'] for w in training_windows], dtype=np.float32),
+            class_names=np.array(class_meta['class_names'], dtype=object),
+            class_mapping_json=json.dumps(class_meta['class_mapping'], ensure_ascii=False),
+            num_classes=np.int32(class_meta['num_classes']),
+            short_class_indices=np.array(class_meta['short_class_indices'], dtype=np.int32),
+            short_movement_ids=np.array(class_meta['short_movement_ids'], dtype=object),
+        )
 
-            print(f"  [OK] Saved {len(training_windows)} windows")
-            return len(training_windows)
-
-        return 0
+        print(f"  [OK] Saved {len(training_windows)} windows")
+        return len(training_windows)
 
     def process_all(self, keypoints_dir, annotations_dir, output_dir):
-        """Process all videos"""
         keypoints_dir = Path(keypoints_dir)
         annotations_dir = Path(annotations_dir)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         keypoint_files = sorted(keypoints_dir.glob('*_keypoints.pkl'))
-
         if not keypoint_files:
             print(f"[!] No keypoint files found in {keypoints_dir}")
             return
 
-        print(f"\n{'='*70}")
-        print(f"CREATING WINDOWS FOR {len(keypoint_files)} VIDEOS")
+        matched = []
+        for keypoints_file in keypoint_files:
+            base_name = keypoints_file.stem.replace('_keypoints', '')
+            ann_file = resolve_annotation_file(annotations_dir, base_name)
+            if ann_file is None:
+                print(f"\n[!] No annotations for {base_name}")
+                continue
+            matched.append((keypoints_file, ann_file, output_dir / f'{base_name}_windows.npz'))
+
+        if not matched:
+            print(f"[!] No matched keypoint/annotation pairs found")
+            return
+
+        class_mapping, class_names = build_class_metadata_from_annotation_files([ann for _, ann, _ in matched])
+        self._set_class_metadata(class_mapping, class_names)
+        metadata_path = save_class_metadata_json(output_dir, self.class_mapping, self.class_names, self.policy.SHORT_MOVEMENT_IDS)
+
+        print(f"\n{'=' * 70}")
+        print(f"CREATING WINDOWS FOR {len(matched)} VIDEOS")
         print(f"Sequence length: {self.sequence_length} frames")
         print(f"Stride: {self.stride} frames")
         print(f"Number of classes: {self.num_classes}")
+        print(f"Short class indices: {sorted(self.short_class_indices)}")
         print(f"Policy profile: {self.policy.PROFILE}")
-        print(f"{'='*70}")
+        print(f"Class metadata: {metadata_path}")
+        print(f"{'=' * 70}")
 
         total_windows = 0
         successful = 0
 
-        for keypoints_file in keypoint_files:
-            base_name = keypoints_file.stem.replace('_keypoints', '')
-            ann_file = annotations_dir / f"{base_name}_annotations.json"
-            output_file = output_dir / f"{base_name}_windows.npz"
-
-            if not ann_file.exists():
-                print(f"\n[!] No annotations for {base_name}")
-                continue
-
+        for keypoints_file, ann_file, output_file in matched:
             try:
                 count = self.process_video(keypoints_file, ann_file, output_file)
                 if count > 0:
                     total_windows += count
                     successful += 1
-            except Exception as e:
-                print(f"[!] ERROR processing {base_name}: {e}")
+            except Exception as exc:
+                print(f"[!] ERROR processing {keypoints_file.stem}: {exc}")
                 import traceback
                 traceback.print_exc()
 
-        # Summary
-        print(f"\n{'='*70}")
-        print("COMPLETE")
-        print(f"{'='*70}")
-        print(f"Videos processed: {successful}/{len(keypoint_files)}")
+        print(f"\n{'=' * 70}")
+        print('COMPLETE')
+        print(f"{'=' * 70}")
+        print(f"Videos processed: {successful}/{len(matched)}")
         print(f"Total windows: {total_windows}")
         print(f"Output: {output_dir}")
-
-        # Show class distribution
         self._print_class_distribution(output_dir)
 
     def _print_class_distribution(self, output_dir):
-        """Print distribution of classes across all windows"""
         output_dir = Path(output_dir)
         all_labels = []
-
-        for npz_file in output_dir.glob('*.npz'):
-            data = np.load(npz_file)
+        for npz_file in output_dir.glob('*_windows.npz'):
+            data = np.load(npz_file, allow_pickle=True)
             all_labels.extend(data['y'].tolist())
 
         if not all_labels:
             return
 
-        print(f"\n{'='*70}")
-        print("CLASS DISTRIBUTION")
-        print(f"{'='*70}")
-
-        class_counts = {}
-        for label in all_labels:
-            class_counts[label] = class_counts.get(label, 0) + 1
-
+        inverse = {idx: mov_id for mov_id, idx in self.class_mapping.items()}
+        print(f"\n{'=' * 70}")
+        print('CLASS DISTRIBUTION')
+        print(f"{'=' * 70}")
         print(f"\n{'Class':<8} {'ID':<8} {'Count':<10} {'Percent':<10}")
-        print(f"{'-'*40}")
+        print('-' * 40)
 
         total = len(all_labels)
-        for class_idx in sorted(class_counts.keys()):
+        class_counts = {}
+        for label in all_labels:
+            label = int(label)
+            class_counts[label] = class_counts.get(label, 0) + 1
+
+        for class_idx in sorted(class_counts):
             count = class_counts[class_idx]
             pct = 100.0 * count / total
-            # Get movement ID from class index
-            mov_id = list(CLASS_MAPPING.keys())[list(CLASS_MAPPING.values()).index(class_idx)]
+            mov_id = inverse.get(class_idx, f'class_{class_idx}')
             print(f"{class_idx:<8} {mov_id:<8} {count:<10} {pct:.1f}%")
 
         print(f"\nTotal samples: {total}")
-        print(f"{'='*70}\n")
+        print(f"{'=' * 70}\n")
 
 
 def main():
     creator = SlidingWindowCreator()
-
     creator.process_all(
         keypoints_dir=Paths.KEYPOINTS_DIR,
         annotations_dir=Paths.RAW_ANNOTATIONS,
-        output_dir=Paths.WINDOWS_DIR
+        output_dir=Paths.WINDOWS_DIR,
     )
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

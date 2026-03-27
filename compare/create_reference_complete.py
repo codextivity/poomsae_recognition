@@ -8,7 +8,7 @@ Features:
 - Extracts keypoints with RTMPose or MediaPipe
 - Saves images in movement folders
 - Saves keypoints.npz in each folder
-- Creates master_22class.pkl reference database
+- Creates master reference database files
 - Creates index.json
 - Supports single-reference and batch-reference creation
 
@@ -37,7 +37,6 @@ import cv2
 import numpy as np
 
 sys.path.append(str(Path(__file__).parent.parent))
-from preprocessing.create_windows import CLASS_MAPPING, CLASS_NAMES
 
 
 class ReferenceCreator:
@@ -253,18 +252,12 @@ class ReferenceCreator:
                 )
                 continue
 
-            if movement_id and movement_id in CLASS_MAPPING:
-                class_idx = CLASS_MAPPING[movement_id]
-            else:
-                class_idx = i
-
             duration = (end_frame - start_frame + 1) / fps if fps > 0 else 0.0
 
             segments.append({
                 'index': i,
                 'movement_id': movement_id,
                 'movement_name': movement_name,
-                'class_idx': class_idx,
                 'start_frame': start_frame,
                 'end_frame': end_frame,
                 'original_start': original_start,
@@ -276,6 +269,23 @@ class ReferenceCreator:
             })
 
         return segments
+
+    def build_class_metadata(self, segments):
+        """Build class metadata directly from movement order in the annotation."""
+        class_mapping = {}
+        class_names = []
+
+        for seg in segments:
+            movement_id = seg['movement_id'] or f'movement_{seg["index"]:02d}'
+            if movement_id not in class_mapping:
+                class_mapping[movement_id] = len(class_mapping)
+                class_names.append(seg['movement_name'])
+
+        for seg in segments:
+            movement_id = seg['movement_id'] or f'movement_{seg["index"]:02d}'
+            seg['class_idx'] = class_mapping[movement_id]
+
+        return class_mapping, class_names
 
     def create_meta(self, movement_id, movement_name, fps):
         """Create metadata JSON string for .npz file."""
@@ -360,6 +370,9 @@ class ReferenceCreator:
             cap.release()
             return None
 
+        class_mapping, class_names = self.build_class_metadata(segments)
+        num_classes = len(class_mapping)
+
         reference_data = {
             'video_name': video_path.name,
             'annotation_file': annotation_path.name,
@@ -367,10 +380,10 @@ class ReferenceCreator:
             'total_frames': total_frames,
             'width': width,
             'height': height,
-            'num_classes': 22,
+            'num_classes': num_classes,
             'trim_start_frames': self.trim_start_frames,
-            'class_names': CLASS_NAMES,
-            'class_mapping': CLASS_MAPPING,
+            'class_names': class_names,
+            'class_mapping': class_mapping,
             'pose_backend': self.pose_backend,
             'movements': [],
         }
@@ -383,6 +396,9 @@ class ReferenceCreator:
             'height': height,
             'trim_start_frames': self.trim_start_frames,
             'pose_backend': self.pose_backend,
+            'num_classes': num_classes,
+            'class_names': class_names,
+            'class_mapping': class_mapping,
             'movements': [],
         }
 
@@ -485,10 +501,16 @@ class ReferenceCreator:
 
         cap.release()
 
-        pkl_path = output_dir / 'master_22class.pkl'
+        pkl_path = output_dir / 'master_reference.pkl'
         with open(pkl_path, 'wb') as f:
             pickle.dump(reference_data, f)
         print(f'\n[OK] Saved: {pkl_path}')
+
+        counted_pkl_path = output_dir / f'master_{num_classes}class.pkl'
+        if counted_pkl_path != pkl_path:
+            with open(counted_pkl_path, 'wb') as f:
+                pickle.dump(reference_data, f)
+            print(f'[OK] Saved: {counted_pkl_path}')
 
         index_path = frames_dir / 'index.json'
         with open(index_path, 'w', encoding='utf-8') as f:
@@ -500,7 +522,8 @@ class ReferenceCreator:
         print(f"{'=' * 70}")
         print('\nOutput structure:')
         print(f'  {output_dir}/')
-        print('  |- master_22class.pkl')
+        print('  |- master_reference.pkl')
+        print(f'  |- master_{num_classes}class.pkl')
         print('  |- frames/')
         print('      |- index.json')
         for seg in segments[:3]:
@@ -677,7 +700,7 @@ def main():
     parser.add_argument(
         '--trim',
         type=int,
-        default=3,
+        default=0,
         help='Frames to trim from the start of movements after the first (default: 3)',
     )
 
@@ -722,5 +745,5 @@ if __name__ == '__main__':
  python compare/create_reference_complete.py --video data/reference/videos/2_jang/front/G018_TG2_front.mp4 --annotation data/reference/annotations/2_jang/front/G018_TG2_front.json --output compare/references_batch
  
 * Batch Mode
- python compare/create_reference_complete.py --video-dir data/reference/videos/3_jang/front --annotation-dir data/reference/annotations/3_jang/front --output compare/references_batch
+ python compare/create_reference_complete.py --video-dir data/reference/videos/1_jang/back --annotation-dir data/reference/annotations/1_jang/back --output compare/references_batch
 '''

@@ -1,18 +1,20 @@
-"""
-Save normalization stats from training data for inference
-"""
-import numpy as np
+"""Save normalization stats from training data for inference."""
+
 import pickle
-from pathlib import Path
 import sys
+from pathlib import Path
+
+import numpy as np
 
 sys.path.append(str(Path(__file__).parent.parent))
 from configs.paths import Paths
 
 
-def save_normalization_stats():
-    """Calculate and save normalization stats from all training windows"""
-    windows_dir = Paths.WINDOWS_DIR
+def save_normalization_stats(windows_dir=None, checkpoint_dir=None, output_name='normalization_stats.pkl'):
+    """Calculate and save normalization stats from all training windows."""
+    windows_dir = Path(windows_dir) if windows_dir is not None else Paths.WINDOWS_DIR
+    checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else Paths.CHECKPOINTS_DIR
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # Load all window files
     window_files = list(windows_dir.glob('*_windows.npz'))
@@ -48,13 +50,14 @@ def save_normalization_stats():
         'input_size': X.shape[2],
     }
 
-    output_path = Paths.CHECKPOINTS_DIR / 'normalization_stats.pkl'
+    output_path = checkpoint_dir / output_name
     with open(output_path, 'wb') as f:
         pickle.dump(stats, f)
 
     print(f"\nSaved to: {output_path}")
     print(f"  Mean range: [{mean.min():.4f}, {mean.max():.4f}]")
     print(f"  Std range: [{std.min():.4f}, {std.max():.4f}]")
+    return output_path
 
 
 if __name__ == "__main__":

@@ -24,16 +24,13 @@ from collections import deque
 
 sys.path.append(str(Path(__file__).parent.parent))
 from models.lstm_classifier import PoomsaeLSTM
+from configs.class_metadata import metadata_from_checkpoint
 from configs.lstm_config import LSTMConfig
 from configs.paths import Paths
-from preprocessing.create_windows import CLASS_NAMES, CLASS_MAPPING
 
 
 class StudentProcessor:
     """Process student video and extract keypoints for comparison"""
-
-    # Short movement classes (faster detection needed)
-    SHORT_MOVEMENT_CLASSES = [6, 12, 14, 17]  # 6_1, 12_1, 14_1, 16_1
 
     # Normalization settings (must match reference)
     NORM_CENTER_JOINT = 19  # Pelvis/hip center
@@ -53,14 +50,28 @@ class StudentProcessor:
         self.stats_path = Path(stats_path) if stats_path else None
         print(f"Using device: {self.device}")
 
-        # Load config
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+        metadata = metadata_from_checkpoint(checkpoint)
+        model_cfg = checkpoint.get('model_config', {})
+
         self.config = LSTMConfig()
-        self.num_classes = self.config.NUM_CLASSES  # 22
-        self.window_size = self.config.SEQUENCE_LENGTH  # 24
+        self.config.NUM_CLASSES = int(model_cfg.get('num_classes', metadata['num_classes']))
+        self.config.SEQUENCE_LENGTH = int(model_cfg.get('sequence_length', self.config.SEQUENCE_LENGTH))
+        self.config.INPUT_SIZE = int(model_cfg.get('input_size', self.config.INPUT_SIZE))
+        self.config.HIDDEN_SIZE = int(model_cfg.get('hidden_size', self.config.HIDDEN_SIZE))
+        self.config.NUM_LAYERS = int(model_cfg.get('num_layers', self.config.NUM_LAYERS))
+        self.config.DROPOUT = float(model_cfg.get('dropout', self.config.DROPOUT))
+        self.config.BIDIRECTIONAL = bool(model_cfg.get('bidirectional', self.config.BIDIRECTIONAL))
+
+        self.num_classes = int(metadata['num_classes'])
+        self.window_size = int(self.config.SEQUENCE_LENGTH)
+        self.class_mapping = metadata['class_mapping']
+        self.class_names = metadata['class_names']
+        self.short_movement_classes = set(metadata.get('short_class_indices', []))
+        self.last_movement_index = self.num_classes - 1
 
         # Load model
         self.model = PoomsaeLSTM(self.config)
-        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(self.device)
         self.model.eval()
@@ -76,9 +87,6 @@ class StudentProcessor:
 
         # Keypoint buffer
         self.keypoint_buffer = deque(maxlen=self.window_size)
-
-        # Class names
-        self.class_names = CLASS_NAMES
 
         # Sequential validation parameters
         self.confirm_frames_expected = 5
@@ -136,7 +144,7 @@ class StudentProcessor:
         self.detected_movements = []
         self.skipped_movements = []
         self.sequence_complete = False
-        self.max_movements = 22
+        self.max_movements = self.num_classes
 
         self.candidate_movement = None
         self.candidate_frames = 0
@@ -223,7 +231,7 @@ class StudentProcessor:
     def get_confirmation_threshold(self, movement, is_expected):
         if is_expected:
             return self.confirm_frames_expected
-        elif movement in self.SHORT_MOVEMENT_CLASSES:
+        elif movement in self.short_movement_classes:
             return self.confirm_frames_short
         elif movement > self.expected_next:
             return self.confirm_frames_future
@@ -231,11 +239,11 @@ class StudentProcessor:
             return self.confirm_frames_normal
 
     def get_confidence_threshold(self, movement, is_expected):
-        if movement in [0, 21]:
+        if movement in [0, self.last_movement_index]:
             return self.conf_threshold_expected
         if is_expected:
             return self.conf_threshold_expected
-        elif movement in self.SHORT_MOVEMENT_CLASSES:
+        elif movement in self.short_movement_classes:
             return self.conf_threshold_short
         elif movement > self.expected_next:
             return self.conf_threshold_skip
@@ -255,7 +263,7 @@ class StudentProcessor:
 
         # First movement must be 0
         if self.expected_next == 0:
-            if predicted == 21:
+            if predicted == self.last_movement_index:
                 return None, "Rejected 19_1 at start"
             if predicted == 0:
                 return self._try_confirm(predicted, confidence, frame_num, is_expected=True)
@@ -268,8 +276,8 @@ class StudentProcessor:
                 return None, f"Waiting for 0_1"
 
         # Last movement only at end
-        if predicted == 21:
-            if self.expected_next == 21:
+        if predicted == self.last_movement_index:
+            if self.expected_next == self.last_movement_index:
                 confirmed = self._try_confirm(predicted, confidence, frame_num, is_expected=True)
                 if confirmed[0] is not None:
                     self.sequence_complete = True
@@ -341,7 +349,7 @@ class StudentProcessor:
 
     def get_movement_id(self, class_idx):
         """Get movement ID from class index"""
-        for mov_id, idx in CLASS_MAPPING.items():
+        for mov_id, idx in self.class_mapping.items():
             if idx == class_idx:
                 return mov_id
         return None
@@ -475,14 +483,14 @@ class StudentProcessor:
                     self.movement_start_frame = frame_num
 
                     count = len(self.detected_movements) + 1
-                    print(f"[{frame_num/self.fps:.1f}s] {self.class_names[valid_movement]} ({conf*100:.1f}%) [{count}/22]")
+                    print(f"[{frame_num/self.fps:.1f}s] {self.class_names[valid_movement]} ({conf*100:.1f}%) [{count}/{self.max_movements}]")
 
             if writer:
                 # Simple overlay for video
                 if self.current_movement is not None:
                     cv2.putText(frame, f"{self.class_names[self.current_movement][:30]}",
                                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(frame, f"Detected: {len(self.detected_movements)+1}/22",
+                    cv2.putText(frame, f"Detected: {len(self.detected_movements)+1}/{self.max_movements}",
                                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 writer.write(frame)
 
@@ -533,7 +541,7 @@ class StudentProcessor:
                 trim_frames = self.trim_start_frames
                 start_frame = start_frame + trim_frames
 
-            print(f"[{i+1:02d}/22] {movement_id} - {movement_name}")
+            print(f"[{i+1:02d}/{len(self.detected_movements):02d}] {movement_id} - {movement_name}")
             if trim_frames > 0:
                 print(f"        Trimmed: {trim_frames} frames")
             print(f"        Frames: {start_frame} - {end_frame}")
@@ -613,7 +621,7 @@ class StudentProcessor:
         print(f"\n{'='*70}")
         print("PROCESSING COMPLETE")
         print(f"{'='*70}")
-        print(f"Detected: {len(self.detected_movements)}/22 movements")
+        print(f"Detected: {len(self.detected_movements)}/{self.max_movements} movements")
         if self.skipped_movements:
             print(f"Skipped: {len(self.skipped_movements)} movements")
         print(f"\nOutput:")
@@ -653,9 +661,14 @@ def main():
     if args.model_path:
         model_path = Path(args.model_path)
     elif args.pose_backend == 'mediapipe':
-        model_path = Paths.CHECKPOINTS_DIR / '22_classes_model_mediapipe' / 'lstm_taegeuk1_best.pth'
+        mediapipe_dir = Paths.CHECKPOINTS_DIR / '22_classes_model_mediapipe'
+        generic_model = mediapipe_dir / 'lstm_best.pth'
+        legacy_model = mediapipe_dir / 'lstm_taegeuk1_best.pth'
+        model_path = generic_model if generic_model.exists() else legacy_model
     else:
-        model_path = Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth'
+        generic_model = Paths.CHECKPOINTS_DIR / 'lstm_best.pth'
+        legacy_model = Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth'
+        model_path = generic_model if generic_model.exists() else legacy_model
 
     if not model_path.exists():
         print(f"Model not found: {model_path}")

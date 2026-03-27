@@ -1,264 +1,208 @@
-"""
-Annotation Diagnostic Tool
-
-This script analyzes all annotation files to identify issues:
-- Missing movements
-- Duplicate movements
-- Incorrect formatting
-- Time overlap issues
-"""
+"""Validate annotation JSON files for the current start/end boundary schema."""
 
 import json
 from pathlib import Path
-from collections import defaultdict
 import sys
 
-sys.path.append(str(Path(__file__).parent))
+sys.path.append(str(Path(__file__).parent.parent))
+from configs.class_metadata import parse_movement_id
 from configs.paths import Paths
 
 
 class AnnotationDiagnostic:
-    """Diagnose annotation file issues"""
+    """Diagnose annotation file issues for explicit start/end annotations."""
+
+    REQUIRED_FIELDS = ('movement', 'startTime', 'frame', 'endTime', 'endFrame')
 
     def __init__(self, annotations_dir):
         self.annotations_dir = Path(annotations_dir)
         self.issues = []
 
-    def analyze_single_file(self, annotation_path):
-        """Analyze a single annotation file"""
-        print(f"\n{'=' * 60}")
-        print(f"Analyzing: {annotation_path.name}")
-        print(f"{'=' * 60}")
+    def _load_files(self):
+        files = sorted(self.annotations_dir.glob('*.json'))
+        if not files:
+            files = sorted(self.annotations_dir.glob('*_annotations.json'))
+        return files
 
-        # Load annotations
+    def _infer_fps(self, data):
+        total_duration = data.get('totalDuration')
+        annotations = data.get('annotations', [])
+        if not total_duration or not annotations:
+            return None
+        last_end_frame = max(int(float(ann.get('endFrame', 0) or 0)) for ann in annotations)
+        if total_duration <= 0 or last_end_frame <= 0:
+            return None
+        return last_end_frame / float(total_duration)
+
+    def analyze_single_file(self, annotation_path):
+        print(f"\n{'=' * 70}")
+        print(f"Analyzing: {annotation_path.name}")
+        print(f"{'=' * 70}")
+
         try:
             with open(annotation_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-        except Exception as e:
-            print(f"❌ ERROR loading file: {e}")
-            self.issues.append(f"{annotation_path.name}: Failed to load - {e}")
-            return None
+        except Exception as exc:
+            issue = f'Failed to load: {exc}'
+            print(f'[ERROR] {issue}')
+            self.issues.append(f'{annotation_path.name}: {issue}')
+            return False
 
         annotations = data.get('annotations', [])
+        expected_movements = int(data.get('expectedMovements', data.get('totalMovements', len(annotations))))
+        actual_movements = len(annotations)
+        print(f'Expected movements: {expected_movements}')
+        print(f'Actual annotations: {actual_movements}')
 
-        # Basic info
-        print(f"Total annotations: {len(annotations)}")
+        file_ok = True
+        if actual_movements != expected_movements:
+            issue = f'expected {expected_movements} annotations, found {actual_movements}'
+            print(f'[ERROR] {issue}')
+            self.issues.append(f'{annotation_path.name}: {issue}')
+            file_ok = False
 
-        if len(annotations) != 20:
-            issue = f"❌ Expected 20 movements, found {len(annotations)}"
-            print(issue)
-            self.issues.append(f"{annotation_path.name}: {issue}")
+        fps_est = self._infer_fps(data)
+        if fps_est is not None:
+            print(f'Estimated FPS from annotations: {fps_est:.3f}')
 
-        # Check format and extract movement numbers
-        movement_numbers = []
-        movement_times = []
+        movement_ids = []
+        prev_end_time = None
+        prev_end_frame = None
 
-        for i, ann in enumerate(annotations):
-            # Check required fields
-            if 'movement' not in ann:
-                issue = f"❌ Annotation {i} missing 'movement' field"
-                print(issue)
-                self.issues.append(f"{annotation_path.name}: {issue}")
-                continue
+        for idx, ann in enumerate(annotations):
+            prefix = f'annotation {idx + 1}'
+            for field in self.REQUIRED_FIELDS:
+                if field not in ann:
+                    issue = f'{prefix} missing {field}'
+                    print(f'[ERROR] {issue}')
+                    self.issues.append(f'{annotation_path.name}: {issue}')
+                    file_ok = False
+                    continue
 
-            if 'startTime' not in ann:
-                issue = f"❌ Annotation {i} missing 'startTime' field"
-                print(issue)
-                self.issues.append(f"{annotation_path.name}: {issue}")
-                continue
+            movement_raw = ann.get('movement', '')
+            movement_id = parse_movement_id(movement_raw)
+            movement_ids.append(movement_id)
 
-            # Extract movement number from format "X. Name"
-            movement_str = ann['movement']
-
-            # Try to parse movement number
-            try:
-                # Format: "2. 아래막기" -> extract "2"
-                if '.' in movement_str:
-                    number_str = movement_str.split('.')[0].strip()
-                    movement_num = int(number_str)
-                else:
-                    # Maybe just a number
-                    movement_num = int(movement_str)
-
-                movement_numbers.append(movement_num)
-
-            except ValueError:
-                issue = f"❌ Cannot parse movement number from: '{movement_str}'"
-                print(issue)
-                self.issues.append(f"{annotation_path.name}: {issue}")
-                continue
-
-            # Parse time
             try:
                 start_time = float(ann['startTime'])
-                movement_times.append((movement_num, start_time))
-            except ValueError:
-                issue = f"❌ Cannot parse startTime: '{ann['startTime']}'"
-                print(issue)
-                self.issues.append(f"{annotation_path.name}: {issue}")
+                end_time = float(ann['endTime'])
+                start_frame = int(float(ann['frame']))
+                end_frame = int(float(ann['endFrame']))
+            except Exception as exc:
+                issue = f'{prefix} has invalid numeric field: {exc}'
+                print(f'[ERROR] {issue}')
+                self.issues.append(f'{annotation_path.name}: {issue}')
+                file_ok = False
+                continue
 
-        # Analysis results
-        print(f"\nMovement numbers found: {sorted(movement_numbers)}")
+            if not movement_id or '_' not in movement_id:
+                issue = f"{prefix} invalid movement format: {movement_raw}"
+                print(f'[ERROR] {issue}')
+                self.issues.append(f'{annotation_path.name}: {issue}')
+                file_ok = False
 
-        # Check for completeness (should be 1-20)
-        expected = set(range(1, 23))
-        found = set(movement_numbers)
+            if end_time < start_time:
+                issue = f'{prefix} endTime < startTime ({end_time} < {start_time})'
+                print(f'[ERROR] {issue}')
+                self.issues.append(f'{annotation_path.name}: {issue}')
+                file_ok = False
 
-        missing = expected - found
-        extra = found - expected
+            if end_frame < start_frame:
+                issue = f'{prefix} endFrame < frame ({end_frame} < {start_frame})'
+                print(f'[ERROR] {issue}')
+                self.issues.append(f'{annotation_path.name}: {issue}')
+                file_ok = False
 
-        if missing:
-            issue = f"❌ Missing movements: {sorted(missing)}"
-            print(issue)
-            self.issues.append(f"{annotation_path.name}: {issue}")
+            if prev_end_time is not None and start_time < prev_end_time:
+                issue = f'{prefix} overlaps previous movement in time ({start_time:.3f} < {prev_end_time:.3f})'
+                print(f'[ERROR] {issue}')
+                self.issues.append(f'{annotation_path.name}: {issue}')
+                file_ok = False
+            elif prev_end_time is not None and start_time > prev_end_time:
+                gap = start_time - prev_end_time
+                print(f'[WARN] {prefix} has a time gap of {gap:.3f}s from previous movement')
 
-        if extra:
-            issue = f"❌ Extra/invalid movements: {sorted(extra)}"
-            print(issue)
-            self.issues.append(f"{annotation_path.name}: {issue}")
+            if prev_end_frame is not None and start_frame < prev_end_frame:
+                issue = f'{prefix} overlaps previous movement in frames ({start_frame} < {prev_end_frame})'
+                print(f'[ERROR] {issue}')
+                self.issues.append(f'{annotation_path.name}: {issue}')
+                file_ok = False
+            elif prev_end_frame is not None and start_frame > prev_end_frame:
+                gap_frames = start_frame - prev_end_frame
+                print(f'[WARN] {prefix} has a frame gap of {gap_frames} from previous movement')
 
-        # Check for duplicates
-        duplicates = [num for num in found if movement_numbers.count(num) > 1]
+            if fps_est is not None:
+                start_err = abs(start_time * fps_est - start_frame)
+                end_err = abs(end_time * fps_est - end_frame)
+                if start_err > 1.5:
+                    issue = f'{prefix} startTime/frame mismatch ({start_err:.2f} frames)'
+                    print(f'[WARN] {issue}')
+                if end_err > 1.5:
+                    issue = f'{prefix} endTime/endFrame mismatch ({end_err:.2f} frames)'
+                    print(f'[WARN] {issue}')
+
+            prev_end_time = end_time
+            prev_end_frame = end_frame
+
+        unique_ids = []
+        seen = set()
+        for movement_id in movement_ids:
+            if movement_id not in seen:
+                seen.add(movement_id)
+                unique_ids.append(movement_id)
+
+        print(f'Unique movement labels: {len(unique_ids)}')
+        print(f'Movement order: {unique_ids}')
+
+        duplicates = sorted({movement_id for movement_id in movement_ids if movement_ids.count(movement_id) > 1})
         if duplicates:
-            issue = f"❌ Duplicate movements: {sorted(set(duplicates))}"
-            print(issue)
-            self.issues.append(f"{annotation_path.name}: {issue}")
+            print(f'[WARN] Duplicate movement IDs present: {duplicates}')
 
-        # Check time ordering
-        sorted_times = sorted(movement_times, key=lambda x: x[1])
-        if sorted_times != movement_times:
-            issue = f"⚠️  Movements not in chronological order"
-            print(issue)
-            # Show expected vs actual order
-            print(f"   Expected order: {[x[0] for x in sorted_times]}")
-            print(f"   Actual order:   {[x[0] for x in movement_times]}")
-
-        # Check for very short/long durations
-        for i in range(len(movement_times) - 1):
-            curr_num, curr_time = movement_times[i]
-            next_num, next_time = movement_times[i + 1]
-            duration = next_time - curr_time
-
-            if duration < 0.5:
-                issue = f"⚠️  Movement {curr_num} duration very short: {duration:.2f}s"
-                print(issue)
-            elif duration > 10:
-                issue = f"⚠️  Movement {curr_num} duration very long: {duration:.2f}s"
-                print(issue)
-                self.issues.append(f"{annotation_path.name}: {issue}")
-
-        # Summary
-        if missing or extra or duplicates:
-            print(f"\n❌ FILE HAS ISSUES")
-            return False
+        if file_ok:
+            print('[OK] File passed required validation')
         else:
-            print(f"\n✓ FILE OK")
-            return True
+            print('[FAIL] File has blocking issues')
+
+        return file_ok
 
     def analyze_all(self):
-        """Analyze all annotation files"""
-        annotation_files = sorted(self.annotations_dir.glob('*_annotations.json'))
-
+        annotation_files = self._load_files()
         if not annotation_files:
-            print(f"❌ No annotation files found in {self.annotations_dir}")
-            return
+            print(f'No annotation files found in {self.annotations_dir}')
+            return False
 
         print(f"\n{'=' * 70}")
-        print(f"ANNOTATION DIAGNOSTIC REPORT")
+        print('ANNOTATION DIAGNOSTIC REPORT')
         print(f"{'=' * 70}")
-        print(f"Found {len(annotation_files)} annotation files\n")
+        print(f'Found {len(annotation_files)} annotation files')
 
         ok_count = 0
-        problem_count = 0
-
-        for ann_file in annotation_files:
-            result = self.analyze_single_file(ann_file)
-            if result:
+        fail_count = 0
+        for annotation_file in annotation_files:
+            if self.analyze_single_file(annotation_file):
                 ok_count += 1
             else:
-                problem_count += 1
+                fail_count += 1
 
-        # Overall summary
         print(f"\n{'=' * 70}")
-        print(f"SUMMARY")
+        print('SUMMARY')
         print(f"{'=' * 70}")
-        print(f"Total files: {len(annotation_files)}")
-        print(f"✓ OK: {ok_count}")
-        print(f"❌ Problems: {problem_count}")
-
+        print(f'Total files: {len(annotation_files)}')
+        print(f'OK: {ok_count}')
+        print(f'FAIL: {fail_count}')
         if self.issues:
-            print(f"\n{'=' * 70}")
-            print(f"ALL ISSUES FOUND ({len(self.issues)} total):")
-            print(f"{'=' * 70}")
+            print('\nBlocking issues:')
             for issue in self.issues:
-                print(f"  • {issue}")
+                print(f'  - {issue}')
 
-        # Aggregate statistics
-        print(f"\n{'=' * 70}")
-        print(f"AGGREGATE STATISTICS")
-        print(f"{'=' * 70}")
-
-        self.check_aggregate_statistics()
-
-    def check_aggregate_statistics(self):
-        """Check overall patterns across all files"""
-        annotation_files = sorted(self.annotations_dir.glob('*_annotations.json'))
-
-        all_movement_numbers = defaultdict(int)
-
-        for ann_file in annotation_files:
-            try:
-                with open(ann_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-
-                annotations = data.get('annotations', [])
-
-                for ann in annotations:
-                    movement_str = ann.get('movement', '')
-
-                    # Parse movement number
-                    try:
-                        if '.' in movement_str:
-                            number_str = movement_str.split('.')[0].strip()
-                            movement_num = int(number_str)
-                        else:
-                            movement_num = int(movement_str)
-
-                        all_movement_numbers[movement_num] += 1
-                    except:
-                        pass
-            except:
-                pass
-
-        print("\nMovement frequency across all files:")
-        for i in range(1, 21):
-            count = all_movement_numbers.get(i, 0)
-            expected = len(annotation_files)
-            status = "✓" if count == expected else "❌"
-            print(f"  {status} Movement {i:2d}: {count:3d} files (expected {expected})")
-
-        # Check which movements are problematic
-        missing_movements = [i for i in range(1, 21) if all_movement_numbers.get(i, 0) < len(annotation_files)]
-        if missing_movements:
-            print(f"\n❌ Movements not in all files: {missing_movements}")
+        return fail_count == 0
 
 
 def main():
-    """Main diagnostic"""
-    Paths.create_directories()
-
     diagnostic = AnnotationDiagnostic(Paths.RAW_ANNOTATIONS)
-    diagnostic.analyze_all()
-
-    print(f"\n{'=' * 70}")
-    print(f"NEXT STEPS")
-    print(f"{'=' * 70}")
-    print(f"1. Fix any annotation files with errors")
-    print(f"2. Ensure all files have exactly 20 movements (1-20)")
-    print(f"3. Ensure movements are in chronological order")
-    print(f"4. Re-run: python preprocessing/create_windows.py")
-    print(f"{'=' * 70}\n")
+    success = diagnostic.analyze_all()
+    raise SystemExit(0 if success else 1)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

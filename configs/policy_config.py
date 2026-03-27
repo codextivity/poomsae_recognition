@@ -1,6 +1,8 @@
 """Switchable policy options for data prep, training sampling, and inference."""
 import os
 
+from configs.class_metadata import DEFAULT_SHORT_MOVEMENT_IDS
+
 
 class PolicyConfig:
     """
@@ -13,8 +15,9 @@ class PolicyConfig:
 
     PROFILE = os.getenv("POOMSAE_POLICY_PROFILE", "short_aware")
 
-    # 22-class indices for short movements: 6_1, 12_1, 14_1, 16_1
-    SHORT_CLASS_INDICES = {6, 12, 14, 17}
+    # Movement IDs that receive short-movement handling when present.
+    SHORT_MOVEMENT_IDS = tuple(DEFAULT_SHORT_MOVEMENT_IDS)
+    SHORT_CLASS_INDICES = set()
 
     # ----------------------------
     # Window selection (preprocess)
@@ -74,18 +77,19 @@ class PolicyConfig:
             cls.PREDICTION_HISTORY_SIZE = 3
             cls.MIN_HISTORY_FOR_SMOOTHING = 2
         else:
-            # Baseline profile (current behavior)
-            cls.KEEP_LOW_QUALITY_WINDOWS = False
+            # Short-aware profile: keep more boundary windows for short classes
+            # while down-weighting noisier samples during training.
+            cls.KEEP_LOW_QUALITY_WINDOWS = True
             cls.KEEP_LOW_FOR_SHORT_CLASSES_ONLY = True
-            cls.LOW_QUALITY_MIN_OVERLAP_PCT = 30.0
+            cls.LOW_QUALITY_MIN_OVERLAP_PCT = 20.0
 
-            cls.USE_QUALITY_AWARE_SAMPLING = False
-            cls.SHORT_CLASS_WEIGHT_MULTIPLIER = 3.0
+            cls.USE_QUALITY_AWARE_SAMPLING = True
+            cls.SHORT_CLASS_WEIGHT_MULTIPLIER = 4.0
             cls.QUALITY_WEIGHT_MULTIPLIERS = {
                 "high": 1.0,
-                "medium": 1.0,
-                "low": 1.0,
-                "none": 1.0,
+                "medium": 0.85,
+                "low": 0.55,
+                "none": 0.25,
             }
 
             cls.ALLOW_SKIP_BY_ONE = True

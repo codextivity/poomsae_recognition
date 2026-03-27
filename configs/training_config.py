@@ -25,7 +25,7 @@ class TrainingConfig:
     SHORT_MOVEMENT_WEIGHT_MULTIPLIER = 3.0  # 3x penalty for misclassifying these
 
     # Early stopping
-    EARLY_STOPPING_PATIENCE = 20
+    EARLY_STOPPING_PATIENCE = 10
     MIN_DELTA = 0.001
 
     # Data split

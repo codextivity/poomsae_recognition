@@ -4,16 +4,16 @@
 class LSTMConfig:
     # Model architecture
     INPUT_SIZE = 78  # 26 keypoints × 3 (x, y, confidence)
-    HIDDEN_SIZE = 128
+    HIDDEN_SIZE = 64
     NUM_LAYERS = 2
-    DROPOUT = 0.3
+    DROPOUT = 0.5
     BIDIRECTIONAL = True
 
     # Output
-    NUM_CLASSES = 22  # For Taegeuk 1 (includes sub-movements 14_1, 14_2, 16_1, 16_2)
+    NUM_CLASSES = 22  # Default fallback; active scripts may override from dataset/checkpoint metadata
 
     # Sequence parameters
-    SEQUENCE_LENGTH = 24  # 0.8 seconds at 30 FPS (optimized for short movements)
+    SEQUENCE_LENGTH = 16  # 0.8 seconds at 30 FPS (optimized for short movements)
     STRIDE = 2  # Dense sampling for better short movement detection
 
     # Feature engineering

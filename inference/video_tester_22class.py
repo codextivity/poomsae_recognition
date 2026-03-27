@@ -32,16 +32,13 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.append(str(Path(__file__).parent.parent))
 from models.lstm_classifier import PoomsaeLSTM
 from configs.lstm_config import LSTMConfig
+from configs.class_metadata import metadata_from_checkpoint
 from configs.paths import Paths
 from configs.policy_config import PolicyConfig
-from preprocessing.create_windows import CLASS_NAMES, CLASS_MAPPING
 
 
 class VideoTester:
-    """Test trained model on video with 22-class support and sequential validation"""
-
-    # Short movement classes (faster detection needed)
-    SHORT_MOVEMENT_CLASSES = [6, 12, 14, 17]  # 6_1, 12_1, 14_1, 16_1
+    """Test a trained model on video with sequential validation."""
 
     def __init__(
         self,
@@ -72,14 +69,28 @@ class VideoTester:
         self.resize_width = max(1, int(resize_width))
         self.resize_height = max(1, int(resize_height))
 
-        # Load config
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+        metadata = metadata_from_checkpoint(checkpoint)
+        model_cfg = checkpoint.get('model_config', {})
+
         self.config = LSTMConfig()
-        self.num_classes = self.config.NUM_CLASSES  # 22
-        self.window_size = self.config.SEQUENCE_LENGTH  # 24
+        self.config.NUM_CLASSES = int(model_cfg.get('num_classes', metadata['num_classes']))
+        self.config.SEQUENCE_LENGTH = int(model_cfg.get('sequence_length', self.config.SEQUENCE_LENGTH))
+        self.config.INPUT_SIZE = int(model_cfg.get('input_size', self.config.INPUT_SIZE))
+        self.config.HIDDEN_SIZE = int(model_cfg.get('hidden_size', self.config.HIDDEN_SIZE))
+        self.config.NUM_LAYERS = int(model_cfg.get('num_layers', self.config.NUM_LAYERS))
+        self.config.DROPOUT = float(model_cfg.get('dropout', self.config.DROPOUT))
+        self.config.BIDIRECTIONAL = bool(model_cfg.get('bidirectional', self.config.BIDIRECTIONAL))
+
+        self.num_classes = int(metadata['num_classes'])
+        self.window_size = int(self.config.SEQUENCE_LENGTH)
+        self.class_mapping = metadata['class_mapping']
+        self.class_names = metadata['class_names']
+        self.short_movement_classes = set(metadata.get('short_class_indices', []))
+        self.last_movement_index = self.num_classes - 1
 
         # Load model
         self.model = PoomsaeLSTM(self.config)
-        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(self.device)
         self.model.eval()
@@ -98,9 +109,6 @@ class VideoTester:
 
         # Keypoint buffer for sliding window
         self.keypoint_buffer = deque(maxlen=self.window_size)
-
-        # Class names (22 classes)
-        self.class_names = CLASS_NAMES
 
         # ========================================
         # SEQUENTIAL VALIDATION PARAMETERS
@@ -152,7 +160,7 @@ class VideoTester:
         self.skipped_movements = []            # List of skipped movements
 
         self.sequence_complete = False         # True when 19_1 is detected
-        self.max_movements = 22                # Maximum detections allowed
+        self.max_movements = self.num_classes  # Maximum detections allowed
 
         # Candidate tracking (for confirmation)
         self.candidate_movement = None         # Movement being evaluated
@@ -323,7 +331,7 @@ class VideoTester:
     def get_confirmation_threshold(self, movement, is_expected):
         """Get number of frames needed to confirm a movement"""
         # Short movements should confirm faster, especially when expected.
-        if movement in self.SHORT_MOVEMENT_CLASSES:
+        if movement in self.short_movement_classes:
             return self.confirm_frames_short if is_expected else self.confirm_frames_future
         if is_expected:
             return self.confirm_frames_expected
@@ -334,11 +342,11 @@ class VideoTester:
     def get_confidence_threshold(self, movement, is_expected):
         """Get confidence threshold for a movement"""
         # Special case: 0_1 and 19_1 have low confidence due to similar poses
-        if movement in [0, 21]:
+        if movement in [0, self.last_movement_index]:
             return self.conf_threshold_boundary
 
         # Short movements use a dedicated threshold, including expected short moves.
-        if movement in self.SHORT_MOVEMENT_CLASSES:
+        if movement in self.short_movement_classes:
             if is_expected:
                 return self.short_expected_conf_overrides.get(movement, self.conf_threshold_short)
             return self.conf_threshold_skip
@@ -350,7 +358,7 @@ class VideoTester:
 
     def _get_min_hold_seconds_for_current(self):
         """Minimum time the current movement should hold before switching."""
-        if self.current_movement in self.SHORT_MOVEMENT_CLASSES:
+        if self.current_movement in self.short_movement_classes:
             return self.min_hold_seconds_short
         return self.min_hold_seconds_normal
 
@@ -380,7 +388,7 @@ class VideoTester:
         # RULE 3: First movement must be 0 (0_1)
         # ========================================
         if self.expected_next == 0:
-            if predicted == 21:  # 19_1 at start - REJECT (pose confusion)
+            if predicted == self.last_movement_index:
                 return None, "Rejected 19_1 at start"
 
             if predicted == 0:
@@ -409,8 +417,8 @@ class VideoTester:
         # ========================================
         # RULE 4: Last movement (21/19_1) only at end
         # ========================================
-        if predicted == 21:
-            if self.expected_next == 21:
+        if predicted == self.last_movement_index:
+            if self.expected_next == self.last_movement_index:
                 # Expected final movement
                 confirmed = self._try_confirm(predicted, confidence, frame_num, is_expected=True)
                 if confirmed[0] is not None:
@@ -450,7 +458,7 @@ class VideoTester:
                 # if the model keeps missing a short movement for a while, allow
                 # one-step recovery only when next movement is very confident.
                 if (
-                    self.expected_next in self.SHORT_MOVEMENT_CLASSES
+                    self.expected_next in self.short_movement_classes
                     and predicted == self.expected_next + 1
                 ):
                     time_since_last = (frame_num - self.last_detection_frame) / self.fps
@@ -621,12 +629,12 @@ class VideoTester:
             draw.text((10, 50), f"Confidence: {confidence*100:.1f}%", font=font_medium, fill=(255, 255, 255))
 
         # Detection count
-        draw.text((10, 85), f"Detected: {len(self.detected_movements)}/22", font=font_medium, fill=(200, 200, 200))
+        draw.text((10, 85), f"Detected: {len(self.detected_movements)}/{self.max_movements}", font=font_medium, fill=(200, 200, 200))
 
         # Expected next (or raw mode info)
         if self.raw_mode:
             draw.text((10, 115), "Raw mode: sequence validation OFF", font=font_small, fill=(255, 200, 120))
-        elif self.expected_next < 22:
+        elif self.expected_next < self.max_movements:
             exp_name = self.class_names[self.expected_next]
             draw.text((10, 115), f"Expected: {exp_name}", font=font_small, fill=(150, 150, 255))
 
@@ -737,7 +745,7 @@ class VideoTester:
                     self.movement_start_frame = frame_num
 
                     count = len(self.detected_movements) + 1
-                    print(f"[{frame_num/self.fps:.1f}s] {self.class_names[valid_movement]} ({conf*100:.1f}%) [{count}/22]")
+                    print(f"[{frame_num/self.fps:.1f}s] {self.class_names[valid_movement]} ({conf*100:.1f}%) [{count}/{self.max_movements}]")
 
             # Draw info
             display_movement = self.current_movement
@@ -890,7 +898,7 @@ class VideoTester:
                         self.movement_start_frame = frame_num
 
                         count = len(self.detected_movements) + 1
-                        print(f"[{frame_num/self.fps:.1f}s] {self.class_names[valid_movement]} ({conf*100:.1f}%) [{count}/22]")
+                        print(f"[{frame_num/self.fps:.1f}s] {self.class_names[valid_movement]} ({conf*100:.1f}%) [{count}/{self.max_movements}]")
 
                 # Draw info (no fixed total frames in webcam mode)
                 display_movement = self.current_movement
@@ -954,7 +962,7 @@ class VideoTester:
         print(f"\n{'='*60}")
         print("DETECTION SUMMARY")
         print(f"{'='*60}")
-        print(f"Detected: {len(self.detected_movements)}/22 movements")
+        print(f"Detected: {len(self.detected_movements)}/{self.max_movements} movements")
 
         if self.skipped_movements:
             print(f"Skipped: {len(self.skipped_movements)} movements")
@@ -978,14 +986,14 @@ class VideoTester:
             unique_movs = sorted({mov['movement'] for mov in self.detected_movements})
             print("STATUS: RAW MODE (sequence validation disabled)")
             print(f"Unique classes seen: {len(unique_movs)}")
-        elif len(self.detected_movements) == 22:
-            print("STATUS: All 22 movements detected!")
+        elif len(self.detected_movements) == self.max_movements:
+            print(f"STATUS: All {self.max_movements} movements detected!")
         elif self.sequence_complete:
             print(f"STATUS: Sequence complete with {len(self.detected_movements)} detections")
             if self.skipped_movements:
                 print(f"        ({len(self.skipped_movements)} movements were skipped)")
         else:
-            missing = 22 - len(self.detected_movements)
+            missing = self.max_movements - len(self.detected_movements)
             print(f"STATUS: Incomplete ({missing} movements not detected)")
         print(f"{'='*60}\n")
 
@@ -1029,7 +1037,12 @@ def main():
     parser.add_argument('--no-display', action='store_true', help='Disable display window')
     args = parser.parse_args()
 
-    model_path = Path(args.model_path) if args.model_path else (Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth')
+    if args.model_path:
+        model_path = Path(args.model_path)
+    else:
+        generic_model = Paths.CHECKPOINTS_DIR / 'lstm_best.pth'
+        legacy_model = Paths.CHECKPOINTS_DIR / 'lstm_taegeuk1_best.pth'
+        model_path = generic_model if generic_model.exists() else legacy_model
     if not model_path.exists():
         print(f"Model not found: {model_path}")
         return
